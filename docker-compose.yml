@@ -1,0 +1,129 @@
+﻿services:
+  auth-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypass
+      POSTGRES_DB: authdb
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+      - ./db/auth/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d authdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  listing-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypass
+      POSTGRES_DB: listingdb
+    volumes:
+      - listing_db_data:/var/lib/postgresql/data
+      - ./db/listing/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d listingdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  order-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypass
+      POSTGRES_DB: orderdb
+    volumes:
+      - order_db_data:/var/lib/postgresql/data
+      - ./db/order/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d orderdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  auth-svc:
+    build: ./services/auth-svc
+    environment:
+      DB_HOST: auth-db
+      DB_USER: myuser
+      DB_PASSWORD: mypass
+      DB_NAME: authdb
+      JWT_SECRET: mysecret
+      NODE_ENV: production
+    depends_on:
+      auth-db:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+
+  listing-svc:
+    build: ./services/listing-svc
+    environment:
+      DB_HOST: listing-db
+      DB_USER: myuser
+      DB_PASSWORD: mypass
+      DB_NAME: listingdb
+      JWT_SECRET: mysecret
+      NODE_ENV: production
+    depends_on:
+      listing-db:
+        condition: service_healthy
+    ports:
+      - "4010:4010"
+    volumes:
+      - ./data/listing-uploads:/app/uploads
+
+  order-svc:
+    build: ./services/order-svc
+    environment:
+      DB_HOST: order-db
+      DB_USER: myuser
+      DB_PASSWORD: mypass
+      DB_NAME: orderdb
+      JWT_SECRET: mysecret
+      NODE_ENV: production
+    depends_on:
+      order-db:
+        condition: service_healthy
+      listing-svc:
+        condition: service_started
+    ports:
+      - "4020:4020"
+
+  shipping-svc:
+    build: ./services/shipping-svc
+    environment:
+      DB_HOST: order-db
+      DB_USER: myuser
+      DB_PASSWORD: mypass
+      DB_NAME: orderdb
+      NODE_ENV: production
+    depends_on:
+      order-db:
+        condition: service_healthy
+    ports:
+      - "4030:4030"
+
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_AUTH_URL:    http://localhost:4000
+      VITE_LISTING_URL: http://localhost:4010
+      VITE_ORDER_URL:   http://localhost:4020
+    depends_on:
+      auth-svc:
+        condition: service_started
+      listing-svc:
+        condition: service_started
+      order-svc:
+        condition: service_started
+    ports:
+      - "3000:3000"
+
+volumes:
+  auth_db_data:
+  listing_db_data:
+  order_db_data:

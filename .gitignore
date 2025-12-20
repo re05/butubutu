@@ -1,0 +1,23 @@
+# env
+.env
+*.env
+
+# logs
+*.log
+logs/
+
+# db data（推測）
+db_data/
+data/
+mariadb_data/
+pg_data/
+
+# node
+node_modules/
+
+# .NET
+bin/
+obj/
+
+# docker
+docker-compose.override.yml
