@@ -29,17 +29,32 @@
       timeout: 3s
       retries: 20
 
-  order-db:
+  trade-db:
     image: postgres:15-alpine
     environment:
       POSTGRES_USER: myuser
       POSTGRES_PASSWORD: mypass
-      POSTGRES_DB: orderdb
+      POSTGRES_DB: tradedb
     volumes:
-      - order_db_data:/var/lib/postgresql/data
-      - ./db/order/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - trade_db_data:/var/lib/postgresql/data
+      - ./db/trade/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d orderdb"]
+      test: ["CMD-SHELL", "pg_isready -U myuser -d tradedb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  shipping-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypass
+      POSTGRES_DB: shippingdb
+    volumes:
+      - shipping_db_data:/var/lib/postgresql/data
+      - ./db/shipping/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d shippingdb"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -76,19 +91,21 @@
     volumes:
       - ./data/listing-uploads:/app/uploads
 
-  order-svc:
-    build: ./services/order-svc
+  trade-svc:
+    build: ./services/trade-svc
     environment:
-      DB_HOST: order-db
+      DB_HOST: trade-db
       DB_USER: myuser
       DB_PASSWORD: mypass
-      DB_NAME: orderdb
+      DB_NAME: tradedb
       JWT_SECRET: mysecret
       NODE_ENV: production
     depends_on:
-      order-db:
+      trade-db:
         condition: service_healthy
       listing-svc:
+        condition: service_started
+      auth-svc:
         condition: service_started
     ports:
       - "4020:4020"
@@ -96,13 +113,13 @@
   shipping-svc:
     build: ./services/shipping-svc
     environment:
-      DB_HOST: order-db
+      DB_HOST: shipping-db
       DB_USER: myuser
       DB_PASSWORD: mypass
-      DB_NAME: orderdb
+      DB_NAME: shippingdb
       NODE_ENV: production
     depends_on:
-      order-db:
+      shipping-db:
         condition: service_healthy
     ports:
       - "4030:4030"
@@ -110,15 +127,18 @@
   frontend:
     build: ./frontend
     environment:
-      VITE_AUTH_URL:    http://localhost:4000
-      VITE_LISTING_URL: http://localhost:4010
-      VITE_ORDER_URL:   http://localhost:4020
+      VITE_AUTH_URL:     http://localhost:4000
+      VITE_LISTING_URL:  http://localhost:4010
+      VITE_TRADE_URL:    http://localhost:4020
+      VITE_SHIPPING_URL: http://localhost:4030
     depends_on:
       auth-svc:
         condition: service_started
       listing-svc:
         condition: service_started
-      order-svc:
+      trade-svc:
+        condition: service_started
+      shipping-svc:
         condition: service_started
     ports:
       - "3000:3000"
@@ -126,4 +146,5 @@
 volumes:
   auth_db_data:
   listing_db_data:
-  order_db_data:
+  trade_db_data:
+  shipping_db_data:
