@@ -97,6 +97,107 @@ async function decreaseStockViaListingSvc(items) {
   return { ok: false, status: resp.status, error: resp.json || { error: 'listing_svc_error', detail: resp.text } };
 }
 
+async function fetchListingSummaryViaListingSvc(ids) {
+  const base = process.env.LISTING_SVC_URL || 'http://listing-svc:4010';
+  const token = process.env.INTERNAL_TOKEN || '';
+  if (!token) {
+    return { ok: false, status: 500, error: { error: 'missing_internal_token' } };
+  }
+
+  const resp = await postJson(
+    `${base}/internal/listings/summary`,
+    { 'X-Internal-Token': token },
+    { ids }
+  );
+
+  if (resp.status >= 200 && resp.status < 300) {
+    const listings = Array.isArray(resp.json?.listings) ? resp.json.listings : [];
+    const missing = Array.isArray(resp.json?.missing) ? resp.json.missing : [];
+    return { ok: true, status: resp.status, data: { listings, missing } };
+  }
+  return {
+    ok: false,
+    status: resp.status || 500,
+    error: resp.json || { error: 'listing_summary_failed', detail: resp.text }
+  };
+}
+
+async function validateTradeItemOwnership({ give_items, take_items, proposer_id, receiver_id }) {
+  const ids = [...new Set([...give_items, ...take_items].map((x) => Number(x.listing_id)))];
+
+  const r = await fetchListingSummaryViaListingSvc(ids);
+  if (!r.ok) return r;
+
+  const listings = r.data.listings || [];
+  const missing = r.data.missing || [];
+
+  if (missing.length) {
+    return { ok: false, status: 404, error: { error: 'listing_not_found', missing } };
+  }
+
+  const map = new Map(listings.map((x) => [Number(x.id), x]));
+
+  // give は proposer の出品、take は receiver の出品であることを強制
+  for (const it of give_items) {
+    const id = Number(it.listing_id);
+    const row = map.get(id);
+    if (!row) return { ok: false, status: 404, error: { error: 'listing_not_found', listing_id: id } };
+
+    if (Number(row.seller_id) !== Number(proposer_id)) {
+      return {
+        ok: false,
+        status: 403,
+        error: { error: 'give_not_owned', listing_id: id, owner_id: Number(row.seller_id) }
+      };
+    }
+    if (String(row.status) !== 'Active') {
+      return {
+        ok: false,
+        status: 409,
+        error: { error: 'give_not_active', listing_id: id, status: String(row.status) }
+      };
+    }
+    if (Number(row.quantity) < Number(it.quantity)) {
+      return {
+        ok: false,
+        status: 409,
+        error: { error: 'give_insufficient_stock', listing_id: id, have: Number(row.quantity), want: Number(it.quantity) }
+      };
+    }
+  }
+
+  for (const it of take_items) {
+    const id = Number(it.listing_id);
+    const row = map.get(id);
+    if (!row) return { ok: false, status: 404, error: { error: 'listing_not_found', listing_id: id } };
+
+    if (Number(row.seller_id) !== Number(receiver_id)) {
+      return {
+        ok: false,
+        status: 403,
+        error: { error: 'take_not_owned', listing_id: id, owner_id: Number(row.seller_id) }
+      };
+    }
+    if (String(row.status) !== 'Active') {
+      return {
+        ok: false,
+        status: 409,
+        error: { error: 'take_not_active', listing_id: id, status: String(row.status) }
+      };
+    }
+    if (Number(row.quantity) < Number(it.quantity)) {
+      return {
+        ok: false,
+        status: 409,
+        error: { error: 'take_insufficient_stock', listing_id: id, have: Number(row.quantity), want: Number(it.quantity) }
+      };
+    }
+  }
+
+  return { ok: true, status: 200 };
+}
+
+
 function normalizeItems(arr) {
   const items = Array.isArray(arr) ? arr : [];
   const out = [];
@@ -141,6 +242,18 @@ app.post('/trades', authRequired, async (req,res)=>{
   if (!take_items || take_items.length === 0) {
     return res.status(400).json({ error: 'take_items_required' });
   }
+
+    // 取引に入れる listing の持ち主を検証（give は自分、take は相手）
+  const chk = await validateTradeItemOwnership({
+    give_items,
+    take_items,
+    proposer_id: req.user.uid,
+    receiver_id
+  });
+  if (!chk.ok) {
+    return res.status(chk.status || 500).json(chk.error || { error: 'ownership_check_failed' });
+  }
+
 
   const client = await pool.connect();
   try{
@@ -329,6 +442,19 @@ app.patch('/trades/:id/accept', authRequired, async (req,res)=>{
       await client.query('ROLLBACK');
       return res.status(400).json({error:'items_missing'});
     }
+    
+        // 承諾時にも再チェック（ここが一番重要：ここを通ると在庫が減る）
+    const chk = await validateTradeItemOwnership({
+      give_items: giveItems,
+      take_items: takeItems,
+      proposer_id: trade.proposer_id,
+      receiver_id: trade.receiver_id
+    });
+    if (!chk.ok) {
+      await client.query('ROLLBACK');
+      return res.status(chk.status || 500).json(chk.error || { error: 'ownership_check_failed' });
+    }
+
 
     const decItems = [...giveItems, ...takeItems];
 
@@ -474,6 +600,19 @@ app.patch('/trades/:id/items', authRequired, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({ error: 'bad_status', status: trade.status });
     }
+
+        // 取引に入れる listing の持ち主を検証（give は proposer、take は receiver）
+    const chk = await validateTradeItemOwnership({
+      give_items,
+      take_items,
+      proposer_id: trade.proposer_id,
+      receiver_id: trade.receiver_id
+    });
+    if (!chk.ok) {
+      await client.query('ROLLBACK');
+      return res.status(chk.status || 500).json(chk.error || { error: 'ownership_check_failed' });
+    }
+
 
     // 既存を消して入れ直す
     await client.query(`DELETE FROM trade_items WHERE trade_id = $1`, [id]);
