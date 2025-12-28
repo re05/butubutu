@@ -2,31 +2,37 @@
 import { Link } from "react-router-dom";
 import { tradeApi } from "./tradeApi";
 
+function statusJa(s) {
+  const v = String(s || "");
+  if (v === "Proposed") return "提案中";
+  if (v === "Accepted") return "承諾済み";
+  if (v === "Shipping") return "発送中";
+  if (v === "Completed") return "完了";
+  if (v === "Rejected") return "却下";
+  return v || "-";
+}
+
+
 export default function Trades() {
   const [outbox, setOutbox] = useState([]);
   const [inbox, setInbox] = useState([]);
   const [err, setErr] = useState("");
 
-  async function reload() {
-    setErr("");
-    try {
-      const [o, i] = await Promise.all([tradeApi.outbox(), tradeApi.inbox()]);
-      setOutbox(Array.isArray(o) ? o : []);
-      setInbox(Array.isArray(i) ? i : []);
-    } catch (e) {
-      setErr(String(e?.message || e));
-    }
-  }
+async function reload() {
+  setErr("");
+  try {
+    const [o, i] = await Promise.all([tradeApi.outbox(), tradeApi.inbox()]);
 
-  async function accept(id) {
-    setErr("");
-    try {
-      await tradeApi.accept(id);
-      await reload();
-    } catch (e) {
-      setErr(String(e?.message || e));
-    }
+    const normalize = (xs) =>
+      (Array.isArray(xs) ? xs : []).filter((t) => String(t?.status) !== "Completed");
+
+    setOutbox(normalize(o));
+    setInbox(normalize(i));
+  } catch (e) {
+    setErr(String(e?.message || e));
   }
+}
+
 
   async function reject(id) {
     setErr("");
@@ -101,7 +107,7 @@ function TradeTable({ rows, actions }) {
         {rows.map((t) => (
           <tr key={t.id}>
             <td>{t.id}</td>
-            <td>{t.status}</td>
+            <td>{statusJa(t.status)}</td>
             <td>{t.proposer_id}</td>
             <td>{t.receiver_id}</td>
             <td><Link to={`/trades/${t.id}`}>開く</Link></td>
