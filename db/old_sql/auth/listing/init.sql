@@ -14,9 +14,9 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 
 CREATE TABLE IF NOT EXISTS listing_comments (
-  id          SERIAL PRIMARY KEY,
-  listing_id  INTEGER NOT NULL,
-  author_id   INTEGER NOT NULL,
-  body        TEXT NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id         SERIAL PRIMARY KEY,
+  listing_id INTEGER NOT NULL,
+  author_id  INTEGER NOT NULL,
+  body       TEXT    NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

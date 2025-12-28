@@ -3,6 +3,8 @@ import { Link, Outlet, useNavigate } from 'react-router-dom'
 import { me } from './api'
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import OrderDetail from './pages/OrderDetail';
+import TradeDebug from './pages/TradeDebug.jsx';
+
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -44,7 +46,7 @@ function App() {
     <BrowserRouter>
       <Routes>
         {/* 既存ルート */}
-        {/* <Route path="/" element={<ListingList />} /> */}
+        <Route path="/debug/trades" element={<TradeDebug />} />
         {/* <Route path="/listings/:id" element={<ListingDetail />} /> */}
 
         <Route path="/orders/:id" element={<OrderDetail />} />

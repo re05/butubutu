@@ -1,3 +1,5 @@
+-- trade-db schema (minimum)
+
 CREATE TABLE IF NOT EXISTS trades (
   id SERIAL PRIMARY KEY,
   proposer_id INTEGER NOT NULL,
@@ -11,10 +13,13 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE TABLE IF NOT EXISTS trade_items (
   id SERIAL PRIMARY KEY,
   trade_id INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
-  side TEXT NOT NULL,         -- give / take
+  side TEXT NOT NULL,
   listing_id INTEGER NOT NULL,
   quantity INTEGER NOT NULL CHECK (quantity > 0)
 );
+
+CREATE INDEX IF NOT EXISTS idx_trade_items_trade_id ON trade_items(trade_id);
+CREATE INDEX IF NOT EXISTS idx_trade_items_listing_id ON trade_items(listing_id);
 
 CREATE TABLE IF NOT EXISTS trade_messages (
   id SERIAL PRIMARY KEY,
@@ -23,3 +28,5 @@ CREATE TABLE IF NOT EXISTS trade_messages (
   content TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS idx_trade_messages_trade_id ON trade_messages(trade_id);

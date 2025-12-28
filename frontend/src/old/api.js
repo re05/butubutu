@@ -1,6 +1,8 @@
 const AUTH = import.meta.env.VITE_AUTH_BASE || 'http://localhost:4000';
 const LIST = import.meta.env.VITE_LISTING_BASE || 'http://localhost:4010';
 const ORDER = import.meta.env.VITE_ORDER_BASE || 'http://localhost:4020';
+const TRADE = import.meta.env.VITE_TRADE_URL || 'http://localhost:4020';
+
 
 export function token() { return localStorage.getItem('jwt') || ''; }
 export function setToken(t) { localStorage.setItem('jwt', t); }
@@ -29,4 +31,31 @@ export const api = {
     buy: (listingId) => fetch(`${ORDER}/orders`, { method:'POST', headers:{'Content-Type':'application/json', Authorization:`Bearer ${token()}`}, body:JSON.stringify({ listingId }) }).then(async r=>{ if(!r.ok) throw new Error(await r.text()); return r.json(); }),
     mine: () => fetch(`${ORDER}/orders/buyer/me`, { headers:{ Authorization:`Bearer ${token()}` } }).then(r=>r.json()),
   }
+    trade: {
+    outbox: () => fetch(`${TRADE}/trades/me/outbox`, {
+      headers: { Authorization: `Bearer ${token()}` }
+    }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); }),
+
+    inbox: () => fetch(`${TRADE}/trades/me/inbox`, {
+      headers: { Authorization: `Bearer ${token()}` }
+    }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); }),
+
+    create: (receiver_id, give_items, take_items, proposal_message='') =>
+      fetch(`${TRADE}/trades`, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json', Authorization:`Bearer ${token()}` },
+        body: JSON.stringify({ receiver_id, give_items, take_items, proposal_message })
+      }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); }),
+
+    accept: (tradeId) => fetch(`${TRADE}/trades/${tradeId}/accept`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token()}` }
+    }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); }),
+
+    reject: (tradeId) => fetch(`${TRADE}/trades/${tradeId}/reject`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token()}` }
+    }).then(async r => { if(!r.ok) throw new Error(await r.text()); return r.json(); }),
+  },
+
 };

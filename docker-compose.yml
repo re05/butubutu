@@ -44,20 +44,7 @@
       timeout: 3s
       retries: 20
 
-  shipping-db:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: mypass
-      POSTGRES_DB: shippingdb
-    volumes:
-      - shipping_db_data:/var/lib/postgresql/data
-      - ./db/shipping/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d shippingdb"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+
 
   auth-svc:
     build: ./services/auth-svc
@@ -72,7 +59,7 @@
       auth-db:
         condition: service_healthy
     ports:
-      - "4000:4000"
+      - "4100:4000"
 
   listing-svc:
     build: ./services/listing-svc
@@ -83,11 +70,12 @@
       DB_NAME: listingdb
       JWT_SECRET: mysecret
       NODE_ENV: production
+      INTERNAL_TOKEN: internal-secret
     depends_on:
       listing-db:
         condition: service_healthy
     ports:
-      - "4010:4010"
+      - "4110:4010"
     volumes:
       - ./data/listing-uploads:/app/uploads
 
@@ -100,6 +88,8 @@
       DB_NAME: tradedb
       JWT_SECRET: mysecret
       NODE_ENV: production
+      INTERNAL_TOKEN: internal-secret
+      LISTING_SVC_URL: http://listing-svc:4010
     depends_on:
       trade-db:
         condition: service_healthy
@@ -108,29 +98,16 @@
       auth-svc:
         condition: service_started
     ports:
-      - "4020:4020"
+      - "4120:4020"
 
-  shipping-svc:
-    build: ./services/shipping-svc
-    environment:
-      DB_HOST: shipping-db
-      DB_USER: myuser
-      DB_PASSWORD: mypass
-      DB_NAME: shippingdb
-      NODE_ENV: production
-    depends_on:
-      shipping-db:
-        condition: service_healthy
-    ports:
-      - "4030:4030"
+
 
   frontend:
     build: ./frontend
     environment:
-      VITE_AUTH_URL:     http://localhost:4000
-      VITE_LISTING_URL:  http://localhost:4010
-      VITE_TRADE_URL:    http://localhost:4020
-      VITE_SHIPPING_URL: http://localhost:4030
+      VITE_AUTH_URL: "http://localhost:4100"
+      VITE_LISTING_URL: "http://localhost:4110"
+      VITE_TRADE_URL: "http://localhost:4120"
     depends_on:
       auth-svc:
         condition: service_started
@@ -138,13 +115,11 @@
         condition: service_started
       trade-svc:
         condition: service_started
-      shipping-svc:
-        condition: service_started
     ports:
-      - "3000:3000"
+      - "3100:3000"
+
 
 volumes:
   auth_db_data:
   listing_db_data:
   trade_db_data:
-  shipping_db_data:

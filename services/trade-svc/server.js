@@ -1,10 +1,12 @@
-﻿// order-svc/server.js
-import express from 'express';
+﻿import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
-import crypto from 'crypto';   
+import http from 'http';
+import https from 'https';
+import { URL } from 'url';
+
 dotenv.config();
 
 const app = express();
@@ -36,135 +38,147 @@ function authRequired(req,res,next){
     req.user = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
     next();
   }catch(e){
-    console.error('jwt verify error (order-svc)', e);
+    console.error('jwt verify error (trade-svc)', e);
     return res.status(401).json({error:'unauthorized'});
   }
 }
 
-function generateShippingCode() {
-  // C2C-と8桁のランダム16進数で簡単な発送コードを作る
-  const rand = crypto.randomBytes(4).toString('hex').toUpperCase();
-  return 'C2C-' + rand;
+function postJson(urlStr, headers, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const lib = u.protocol === 'https:' ? https : http;
+    const data = JSON.stringify(bodyObj);
+
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+          ...headers,
+        },
+      },
+      (res) => {
+        let text = '';
+        res.on('data', (d) => (text += d));
+        res.on('end', () => {
+          let json = null;
+          try { json = text ? JSON.parse(text) : null; } catch {}
+          resolve({ status: res.statusCode || 0, json, text });
+        });
+      }
+    );
+
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
 }
 
+async function decreaseStockViaListingSvc(items) {
+  const base = process.env.LISTING_SVC_URL || 'http://listing-svc:4010';
+  const token = process.env.INTERNAL_TOKEN || '';
+  if (!token) {
+    return { ok: false, status: 500, error: { error: 'missing_internal_token' } };
+  }
 
-app.get('/health',(req,res)=>res.json({ok:true, service:'order-svc'}));
+  const resp = await postJson(
+    `${base}/internal/listings/decrease`,
+    { 'X-Internal-Token': token },
+    { items }
+  );
+
+  if (resp.status >= 200 && resp.status < 300) {
+    return { ok: true, status: resp.status, data: resp.json };
+  }
+  return { ok: false, status: resp.status, error: resp.json || { error: 'listing_svc_error', detail: resp.text } };
+}
+
+function normalizeItems(arr) {
+  const items = Array.isArray(arr) ? arr : [];
+  const out = [];
+  for (const it of items) {
+    const listing_id = Number(it?.listing_id);
+    const quantity = Number(it?.quantity);
+    if (!Number.isInteger(listing_id) || !Number.isInteger(quantity) || quantity <= 0) {
+      return null;
+    }
+    out.push({ listing_id, quantity });
+  }
+  return out;
+}
+
+app.get('/health',(req,res)=>res.json({ok:true, service:'trade-svc'}));
 
 /**
- * 購入
- * status: CREATED = 購入済み・発送待ち
+ * 交換提案作成
+ * body:
+ * {
+ *   receiver_id: number,
+ *   proposal_message?: string,
+ *   give_items: [{listing_id, quantity}],
+ *   take_items: [{listing_id, quantity}]
+ * }
  */
-app.post('/orders', authRequired, async (req,res)=>{
-  const { listingId } = req.body || {};
-  if(!listingId) return res.status(400).json({error:'bad_request'});
+app.post('/trades', authRequired, async (req,res)=>{
+  const receiver_id = Number(req.body?.receiver_id);
+  const proposal_message = (req.body?.proposal_message || '').toString();
+  const give_items = normalizeItems(req.body?.give_items);
+  const take_items = normalizeItems(req.body?.take_items);
+
+  if (!Number.isInteger(receiver_id) || receiver_id <= 0) {
+    return res.status(400).json({ error: 'bad_receiver_id' });
+  }
+  if (receiver_id === req.user.uid) {
+    return res.status(400).json({ error: 'self_trade' });
+  }
+  if (!give_items || give_items.length === 0) {
+    return res.status(400).json({ error: 'give_items_required' });
+  }
+  if (!take_items || take_items.length === 0) {
+    return res.status(400).json({ error: 'take_items_required' });
+  }
 
   const client = await pool.connect();
   try{
     await client.query('BEGIN');
 
-    // 対象出品をロック付きで取得
-    const q1 = await client.query(
-      'SELECT id,title,price,status,seller_id FROM listings WHERE id=$1 FOR UPDATE',
-      [listingId]
+    const t = await client.query(
+      `INSERT INTO trades(proposer_id, receiver_id, status, proposal_message)
+       VALUES($1,$2,$3,$4)
+       RETURNING id, proposer_id, receiver_id, status, proposal_message, created_at, accepted_at,
+          shipped_proposer_at, shipped_receiver_at,
+          received_proposer_at, received_receiver_at,
+          completed_at
+`,
+      [req.user.uid, receiver_id, 'Proposed', proposal_message]
     );
-    if(q1.rowCount === 0){
-      await client.query('ROLLBACK');
-      return res.status(404).json({error:'not_found'});
+
+    const trade = t.rows[0];
+
+    for (const it of give_items) {
+      await client.query(
+        `INSERT INTO trade_items(trade_id, side, listing_id, quantity)
+         VALUES($1,$2,$3,$4)`,
+        [trade.id, 'give', it.listing_id, it.quantity]
+      );
     }
-    const l = q1.rows[0];
-
-    // 自分の出品は買えない
-    if(l.seller_id === req.user.uid){
-      await client.query('ROLLBACK');
-      return res.status(403).json({error:'own_listing'});
+    for (const it of take_items) {
+      await client.query(
+        `INSERT INTO trade_items(trade_id, side, listing_id, quantity)
+         VALUES($1,$2,$3,$4)`,
+        [trade.id, 'take', it.listing_id, it.quantity]
+      );
     }
-    // Active 以外は買えない
-    if(l.status !== 'Active'){
-      await client.query('ROLLBACK');
-      return res.status(409).json({error:'not_active'});
-    }
-
-    // ここで購入者の住所情報を取得
-    const uq = await client.query(
-      `SELECT full_name, postal_code, prefecture, city, address_line, phone
-         FROM users
-        WHERE id = $1`,
-      [req.user.uid]
-    );
-    if (uq.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'user_not_found' });
-    }
-    const u = uq.rows[0];
-
-    // users テーブルからヤマト用の住所情報を組み立てる
-    const shippingName       = u.full_name;
-    const shippingPostalCode = u.postal_code;
-    const shippingAddress1   = `${u.prefecture}${u.city}${u.address_line}`;
-    const shippingAddress2   = '';   // 必要なら別途列を分ける
-    const shippingPhone      = u.phone;
-
-    const shippingCode = generateShippingCode();
-
-    // orders に登録（個人情報は orders には持たせない）
-    const q2 = await client.query(
-      `INSERT INTO orders(
-         listing_id,
-         buyer_id,
-         status,
-         shipping_code,
-         yamato_status
-       )
-       VALUES($1,$2,$3,$4,$5)
-       RETURNING id,status,created_at,shipping_code`,
-      [
-        listingId,
-        req.user.uid,
-        'CREATED',
-        shippingCode,
-        'PENDING'
-      ]
-    );
-    const o = q2.rows[0];
-
-    // 個人情報は shipping_labels にだけ保存する
-    await client.query(
-      `INSERT INTO shipping_labels(
-         code,
-         order_id,
-         name,
-         postal_code,
-         address1,
-         address2,
-         phone
-       )
-       VALUES($1,$2,$3,$4,$5,$6,$7)`,
-      [
-        shippingCode,
-        o.id,
-        shippingName,
-        shippingPostalCode,
-        shippingAddress1,
-        shippingAddress2,
-        shippingPhone
-      ]
-    );
-
-    // 出品を Sold に更新
-    await client.query(
-      'UPDATE listings SET status=$1 WHERE id=$2',
-      ['Sold', listingId]
-    );
 
     await client.query('COMMIT');
 
     return res.status(201).json({
-      id: o.id,
-      status: o.status,
-      created_at: o.created_at,
-      shipping_code: o.shipping_code,
-      listing: { id: l.id, title: l.title, price: l.price, seller_id: l.seller_id },
-      buyer_id: req.user.uid
+      ...trade,
+      items: { give: give_items, take: take_items }
     });
 
   }catch(e){
@@ -176,21 +190,20 @@ app.post('/orders', authRequired, async (req,res)=>{
   }
 });
 
-
 /**
- * 自分が買った注文一覧
- * listings.image_url も返す
+ * 自分の提案一覧（送信箱）
  */
-app.get('/orders/buyer/me', authRequired, async (req,res)=>{
+app.get('/trades/me/outbox', authRequired, async (req,res)=>{
   try{
     const q = await pool.query(
-      `SELECT o.id, o.status, o.created_at,
-              o.buyer_id,
-              l.id AS listing_id, l.title, l.price, l.seller_id, l.image_url
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE o.buyer_id = $1
-       ORDER BY o.id DESC`,
+      `SELECT id, proposer_id, receiver_id, status, proposal_message, created_at, accepted_at,
+       shipped_proposer_at, shipped_receiver_at,
+       received_proposer_at, received_receiver_at,
+       completed_at
+
+         FROM trades
+        WHERE proposer_id = $1
+        ORDER BY id DESC`,
       [req.user.uid]
     );
     return res.json(q.rows);
@@ -201,19 +214,19 @@ app.get('/orders/buyer/me', authRequired, async (req,res)=>{
 });
 
 /**
- * 自分の出品が売れた注文一覧
- * listings.image_url も返す
+ * 自分の受信一覧（受信箱）
  */
-app.get('/orders/seller/me', authRequired, async (req,res)=>{
+app.get('/trades/me/inbox', authRequired, async (req,res)=>{
   try{
     const q = await pool.query(
-      `SELECT o.id, o.status, o.created_at,
-              o.buyer_id,
-              l.id AS listing_id, l.title, l.price, l.seller_id, l.image_url
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE l.seller_id = $1
-       ORDER BY o.id DESC`,
+      `SELECT id, proposer_id, receiver_id, status, proposal_message, created_at, accepted_at,
+       shipped_proposer_at, shipped_receiver_at,
+       received_proposer_at, received_receiver_at,
+       completed_at
+
+         FROM trades
+        WHERE receiver_id = $1
+        ORDER BY id DESC`,
       [req.user.uid]
     );
     return res.json(q.rows);
@@ -224,385 +237,373 @@ app.get('/orders/seller/me', authRequired, async (req,res)=>{
 });
 
 /**
- * 取引詳細
- * image_url / 各タイミングの日時も返す
+ * 取引詳細（items込み）
  */
-app.get('/orders/:id', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
-
-  try {
-    const q = await pool.query(
-      `SELECT
-         o.id,
-         o.listing_id,
-         o.buyer_id,
-         o.status,
-         o.created_at,
-         o.shipped_at,
-         o.delivered_at,
-         o.confirmed_at,
-         o.shipping_name,
-         o.shipping_postal_code,
-         o.shipping_address1,
-         o.shipping_address2,
-         o.shipping_phone,
-         o.shipping_code,
-         o.yamato_tracking_no,
-         o.yamato_status,
-         l.title,
-         l.price,
-         l.seller_id,
-         l.image_url
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE o.id = $1`,
-      [id]
-    );
-
-    if (q.rowCount === 0) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-
-    const row = q.rows[0];
-
-    // 当事者以外は見せない（admin は特例で許可）
-    if (
-      row.seller_id !== req.user.uid &&
-      row.buyer_id !== req.user.uid &&
-      req.user.role !== 'admin'
-    ) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    // 個人情報は返さず、安全な情報だけを返す
-    const safe = {
-      id: row.id,
-      listing_id: row.listing_id,
-      buyer_id: row.buyer_id,
-      status: row.status,
-      created_at: row.created_at,
-      shipped_at: row.shipped_at,
-      delivered_at: row.delivered_at,
-      confirmed_at: row.confirmed_at,
-
-
-      // ヤマト関連の状態
-      yamato_tracking_no: row.yamato_tracking_no,
-      yamato_status: row.yamato_status,
-
-      // 商品情報
-      title: row.title,
-      price: row.price,
-      seller_id: row.seller_id,
-      image_url: row.image_url
-    };
-
-    return res.json(safe);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  }
-});
-
-
-/**
- * 出品者が「発送した」と押す
- * CREATED -> SHIPPED
- */
-app.patch('/orders/:id/ship', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const q = await client.query(
-      `SELECT o.id, o.status, o.buyer_id, l.seller_id
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE o.id = $1
-       FOR UPDATE`,
-      [id]
-    );
-    if (q.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'not_found' });
-    }
-
-    const o = q.rows[0];
-
-    // 出品者以外は操作禁止
-    if (o.seller_id !== req.user.uid) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    // CREATED 以外からは発送に遷移させない
-    if (o.status !== 'CREATED') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'bad_status' });
-    }
-
-    const u = await client.query(
-      `UPDATE orders
-       SET status = 'SHIPPED',
-           shipped_at = now()
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-
-    await client.query('COMMIT');
-    return res.json(u.rows[0]);
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  } finally {
-    client.release();
-  }
-});
-
-
-/**
- * 到着済みにする（買い手だけ）
- * SHIPPED -> DELIVERED
- */
-app.patch('/orders/:id/deliver', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const q = await client.query(
-      `SELECT o.id, o.status, o.buyer_id, l.seller_id
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE o.id = $1
-       FOR UPDATE`,
-      [id]
-    );
-    if (q.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'not_found' });
-    }
-
-    const o = q.rows[0];
-
-    // 購入者以外は操作禁止
-    if (o.buyer_id !== req.user.uid) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    // SHIPPED のときだけ DELIVERED に進める
-    if (o.status !== 'SHIPPED') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'bad_status' });
-    }
-
-    const u = await client.query(
-      `UPDATE orders
-       SET status = 'DELIVERED',
-           delivered_at = now()
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-
-    await client.query('COMMIT');
-    return res.json(u.rows[0]);
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  } finally {
-    client.release();
-  }
-});
-
-
-/**
- * 完了にする（買い手だけ）
- * DELIVERED -> COMPLETED
- */
-app.patch('/orders/:id/complete', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const q = await client.query(
-      `SELECT o.id, o.status, o.buyer_id, l.seller_id
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE o.id = $1
-       FOR UPDATE`,
-      [id]
-    );
-    if (q.rowCount === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'not_found' });
-    }
-
-    const o = q.rows[0];
-
-    // 購入者以外は操作禁止
-    if (o.buyer_id !== req.user.uid) {
-      await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    // DELIVERED のときだけ COMPLETED に進める
-    if (o.status !== 'DELIVERED') {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'bad_status' });
-    }
-
-    const u = await client.query(
-      `UPDATE orders
-       SET status = 'COMPLETED',
-           confirmed_at = now()
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-
-    await client.query('COMMIT');
-    return res.json(u.rows[0]);
-  } catch (e) {
-    await client.query('ROLLBACK');
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  } finally {
-    client.release();
-  }
-});
-
-
-// =========================
-// 取引メッセージ API
-// =========================
-
-app.get('/orders/:id/messages', authRequired, async (req,res)=>{
+app.get('/trades/:id', authRequired, async (req,res)=>{
   const id = Number(req.params.id);
   if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
 
   try{
-    const q1 = await pool.query(
-      `SELECT o.id, o.buyer_id, o.status, l.seller_id
-         FROM orders o
-         JOIN listings l ON o.listing_id = l.id
-        WHERE o.id = $1`,
+    const t = await pool.query(
+      `SELECT id, proposer_id, receiver_id, status, proposal_message, created_at, accepted_at,
+       shipped_proposer_at, shipped_receiver_at,
+       received_proposer_at, received_receiver_at,
+       completed_at
+
+         FROM trades
+        WHERE id = $1`,
       [id]
     );
-    if(q1.rowCount === 0) return res.status(404).json({error:'not_found'});
-    const o = q1.rows[0];
+    if(t.rowCount === 0) return res.status(404).json({error:'not_found'});
 
-    if(req.user.role !== 'admin'){
-      if(o.buyer_id !== req.user.uid && o.seller_id !== req.user.uid){
-        return res.status(403).json({error:'forbidden'});
-      }
+    const trade = t.rows[0];
+
+    if (trade.proposer_id !== req.user.uid && trade.receiver_id !== req.user.uid && req.user.role !== 'admin') {
+      return res.status(403).json({error:'forbidden'});
     }
 
-    const q2 = await pool.query(
-      `SELECT id, order_id, sender_id, body, created_at
-         FROM order_messages
-        WHERE order_id = $1
+    const items = await pool.query(
+      `SELECT side, listing_id, quantity
+         FROM trade_items
+        WHERE trade_id = $1
         ORDER BY id ASC`,
       [id]
     );
 
-    return res.json(q2.rows);
+    return res.json({ ...trade, items: items.rows });
   }catch(e){
     console.error(e);
     return res.status(500).json({error:'server_error'});
   }
 });
 
-app.post('/orders/:id/messages', authRequired, async (req,res)=>{
+/**
+ * 承諾（受信者だけ）
+ * Proposed -> Accepted
+ * ここで listing-svc に在庫減算を依頼する（DB分離のため）
+ */
+app.patch('/trades/:id/accept', authRequired, async (req,res)=>{
   const id = Number(req.params.id);
   if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
 
-  const { text } = req.body || {};
-  const body = (text || '').trim();
-  if(!body) return res.status(400).json({error:'empty'});
-
+  const client = await pool.connect();
   try{
-    const q1 = await pool.query(
-      `SELECT o.id, o.buyer_id, o.status, l.seller_id
-         FROM orders o
-         JOIN listings l ON o.listing_id = l.id
-        WHERE o.id = $1`,
+    await client.query('BEGIN');
+
+    const t = await client.query(
+      `SELECT id, proposer_id, receiver_id, status
+         FROM trades
+        WHERE id = $1
+        FOR UPDATE`,
       [id]
     );
-    if(q1.rowCount === 0) return res.status(404).json({error:'not_found'});
-    const o = q1.rows[0];
-
-    if(req.user.role === 'admin'){
-      return res.status(403).json({error:'admin_view_only'});
+    if(t.rowCount === 0){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'not_found'});
     }
 
-    if(o.buyer_id !== req.user.uid && o.seller_id !== req.user.uid){
+    const trade = t.rows[0];
+
+    if (trade.receiver_id !== req.user.uid) {
+      await client.query('ROLLBACK');
       return res.status(403).json({error:'forbidden'});
     }
-
-    if(o.status === 'COMPLETED'){
-      return res.status(409).json({error:'completed'});
+    if (trade.status !== 'Proposed') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'bad_status', status: trade.status});
     }
 
-    const q2 = await pool.query(
-      `INSERT INTO order_messages(order_id, sender_id, body)
-       VALUES($1,$2,$3)
-       RETURNING id, order_id, sender_id, body, created_at`,
-      [id, req.user.uid, body]
+    // give/take 両方を在庫減算（成立したら双方の在庫が減る）
+    const it = await client.query(
+      `SELECT listing_id, quantity, side
+         FROM trade_items
+        WHERE trade_id = $1
+        ORDER BY id ASC`,
+      [id]
     );
 
-    return res.status(201).json(q2.rows[0]);
+    const items = it.rows.map(r => ({ listing_id: Number(r.listing_id), quantity: Number(r.quantity), side: r.side }));
+    const giveItems = items.filter(x => x.side === 'give').map(x => ({ listing_id: x.listing_id, quantity: x.quantity }));
+    const takeItems = items.filter(x => x.side === 'take').map(x => ({ listing_id: x.listing_id, quantity: x.quantity }));
+    if (giveItems.length === 0 || takeItems.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({error:'items_missing'});
+    }
+
+    const decItems = [...giveItems, ...takeItems];
+
+    // 外部（listing-svc）で減算（成功したら trade-db を更新）
+    const dec = await decreaseStockViaListingSvc(decItems);
+    if (!dec.ok) {
+      await client.query('ROLLBACK');
+      // listing-svc のエラーをそのまま返す（試作はこれで十分）
+      return res.status(dec.status || 500).json(dec.error || { error: 'listing_decrease_failed' });
+    }
+
+    const u = await client.query(
+      `UPDATE trades
+          SET status = 'Accepted',
+              accepted_at = now()
+        WHERE id = $1
+        RETURNING id, proposer_id, receiver_id, status, proposal_message, created_at, accepted_at,
+          shipped_proposer_at, shipped_receiver_at,
+          received_proposer_at, received_receiver_at,
+          completed_at
+`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+    return res.json(u.rows[0]);
+
   }catch(e){
+    await client.query('ROLLBACK');
     console.error(e);
     return res.status(500).json({error:'server_error'});
+  }finally{
+    client.release();
   }
 });
 
-// admin 用：全ての取引一覧（画像付き）
-app.get('/orders/admin/all', authRequired, async (req,res)=>{
+/**
+ * 却下（受信者だけ）
+ * Proposed -> Rejected
+ */
+app.patch('/trades/:id/reject', authRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+
+  const client = await pool.connect();
   try{
-    if(req.user.role !== 'admin'){
+    await client.query('BEGIN');
+
+    const t = await client.query(
+      `SELECT id, proposer_id, receiver_id, status
+         FROM trades
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if(t.rowCount === 0){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'not_found'});
+    }
+
+    const trade = t.rows[0];
+
+    if (trade.receiver_id !== req.user.uid) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({error:'forbidden'});
+    }
+    if (trade.status !== 'Proposed') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'bad_status', status: trade.status});
+    }
+
+    const u = await client.query(
+      `UPDATE trades
+          SET status = 'Rejected'
+        WHERE id = $1
+        RETURNING id, proposer_id, receiver_id, status, proposal_message, created_at, accepted_at,
+          shipped_proposer_at, shipped_receiver_at,
+          received_proposer_at, received_receiver_at,
+          completed_at
+`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+    return res.json(u.rows[0]);
+
+  }catch(e){
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }finally{
+    client.release();
+  }
+});
+
+/**
+ * 発送した（当事者だけ）
+ * Accepted / Shipping の間で押せる
+ * 押した人の shipped_*_at を埋め、status を Shipping にする
+ */
+/**
+ * 発送通知（Accepted/Shipping で、本人分が未発送なら押せる）
+ * 押したら status を Shipping にする（Accepted の場合）
+ */
+app.patch('/trades/:id/ship', authRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+
+  const uid = Number(req.user?.uid || 0);
+
+  const client = await pool.connect();
+  try{
+    await client.query('BEGIN');
+
+    const t = await client.query(
+      `SELECT *
+         FROM trades
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if(t.rowCount === 0){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'not_found'});
+    }
+    const trade = t.rows[0];
+
+    if (Number(trade.proposer_id) !== uid && Number(trade.receiver_id) !== uid && req.user.role !== 'admin') {
+      await client.query('ROLLBACK');
       return res.status(403).json({error:'forbidden'});
     }
 
+    if (trade.status !== 'Accepted' && trade.status !== 'Shipping') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'bad_status', status: trade.status});
+    }
+
+    const isProposer = Number(trade.proposer_id) === uid;
+    const col = isProposer ? 'shipped_proposer_at' : 'shipped_receiver_at';
+    if (trade[col]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'already_shipped'});
+    }
+
+    const u = await client.query(
+      `UPDATE trades
+          SET ${col} = now(),
+              status = CASE WHEN status='Accepted' THEN 'Shipping' ELSE status END
+        WHERE id = $1
+      RETURNING *`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+    return res.json(u.rows[0]);
+  }catch(e){
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }finally{
+    client.release();
+  }
+});
+
+/**
+ * 到着通知（Shipping で、両者発送済みの時だけ）
+ * 両者到着済みになったら Completed にする
+ */
+app.patch('/trades/:id/received', authRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+
+  const uid = Number(req.user?.uid || 0);
+
+  const client = await pool.connect();
+  try{
+    await client.query('BEGIN');
+
+    const t = await client.query(
+      `SELECT *
+         FROM trades
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if(t.rowCount === 0){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'not_found'});
+    }
+    const trade = t.rows[0];
+
+    if (Number(trade.proposer_id) !== uid && Number(trade.receiver_id) !== uid && req.user.role !== 'admin') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({error:'forbidden'});
+    }
+
+    if (trade.status !== 'Shipping') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'bad_status', status: trade.status});
+    }
+
+    if (!trade.shipped_proposer_at || !trade.shipped_receiver_at) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'not_both_shipped'});
+    }
+
+    const isProposer = Number(trade.proposer_id) === uid;
+    const col = isProposer ? 'received_proposer_at' : 'received_receiver_at';
+    if (trade[col]) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'already_received'});
+    }
+
+    const u1 = await client.query(
+      `UPDATE trades SET ${col}=now() WHERE id=$1 RETURNING *`,
+      [id]
+    );
+    const after = u1.rows[0];
+
+    let finalRow = after;
+    if (after.received_proposer_at && after.received_receiver_at) {
+      const u2 = await client.query(
+        `UPDATE trades SET status='Completed', completed_at=now() WHERE id=$1 RETURNING *`,
+        [id]
+      );
+      finalRow = u2.rows[0];
+    }
+
+    await client.query('COMMIT');
+    return res.json(finalRow);
+  }catch(e){
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }finally{
+    client.release();
+  }
+});
+
+
+
+/**
+ * 成立後チャット（Accepted 以降のみ）
+ */
+app.get('/trades/:id/messages', authRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+
+  try{
+    const t = await pool.query(
+      `SELECT id, proposer_id, receiver_id, status
+         FROM trades
+        WHERE id = $1`,
+      [id]
+    );
+    if(t.rowCount === 0) return res.status(404).json({error:'not_found'});
+    const trade = t.rows[0];
+
+    if (req.user.role !== 'admin') {
+      if (trade.proposer_id !== req.user.uid && trade.receiver_id !== req.user.uid) {
+        return res.status(403).json({error:'forbidden'});
+      }
+    }
+
+    if (trade.status !== 'Accepted' && trade.status !== 'Shipping' && trade.status !== 'Completed') {
+      return res.status(409).json({error:'not_accepted_yet', status: trade.status});
+    }
+
+
     const q = await pool.query(
-      `SELECT
-         o.id,
-         o.status,
-         o.buyer_id,
-         o.listing_id,
-         o.created_at,
-         o.shipped_at,
-         o.delivered_at,
-         o.confirmed_at,
-         l.title,
-         l.price,
-         l.seller_id,
-         l.image_url
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       ORDER BY o.id DESC`
+      `SELECT id, trade_id, sender_id, content, created_at
+         FROM trade_messages
+        WHERE trade_id = $1
+        ORDER BY id ASC`,
+      [id]
     );
 
     return res.json(q.rows);
@@ -612,62 +613,47 @@ app.get('/orders/admin/all', authRequired, async (req,res)=>{
   }
 });
 
-// 発送コードから発送先情報を取得するAPI（ヤマト想定）
-// 認証なしでアクセスできる前提の設計例
-app.get('/shipping/:code', async (req, res) => {
-  const code = req.params.code || '';
+app.post('/trades/:id/messages', authRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
 
-  if (!code) {
-    return res.status(400).json({ error: 'bad_code' });
-  }
+  const content = (req.body?.content || '').toString().trim();
+  if(!content) return res.status(400).json({error:'empty'});
 
-  try {
-    const q = await pool.query(
-      `SELECT
-         o.id          AS order_id,
-         o.shipping_name,
-         o.shipping_postal_code,
-         o.shipping_address1,
-         o.shipping_address2,
-         o.shipping_phone,
-         o.shipping_code,
-         o.yamato_tracking_no,
-         o.yamato_status,
-         l.id          AS listing_id,
-         l.title,
-         l.price
-       FROM orders o
-       JOIN listings l ON o.listing_id = l.id
-       WHERE o.shipping_code = $1`,
-      [code]
+  try{
+    const t = await pool.query(
+      `SELECT id, proposer_id, receiver_id, status
+         FROM trades
+        WHERE id = $1`,
+      [id]
     );
+    if(t.rowCount === 0) return res.status(404).json({error:'not_found'});
+    const trade = t.rows[0];
 
-    if (q.rowCount === 0) {
-      return res.status(404).json({ error: 'not_found' });
+    if (req.user.role === 'admin') {
+      return res.status(403).json({error:'admin_view_only'});
+    }
+    if (trade.proposer_id !== req.user.uid && trade.receiver_id !== req.user.uid) {
+      return res.status(403).json({error:'forbidden'});
+    }
+    if (trade.status !== 'Accepted' && trade.status !== 'Shipping' && trade.status !== 'Completed') {
+      return res.status(409).json({error:'not_accepted_yet', status: trade.status});
     }
 
-    const o = q.rows[0];
 
-    return res.json({
-      order_id:           o.order_id,
-      listing_id:         o.listing_id,
-      title:              o.title,
-      price:              o.price,
-      shipping_name:      o.shipping_name,
-      shipping_postal_code: o.shipping_postal_code,
-      shipping_address1:  o.shipping_address1,
-      shipping_address2:  o.shipping_address2,
-      shipping_phone:     o.shipping_phone,
-      shipping_code:      o.shipping_code,
-      yamato_tracking_no: o.yamato_tracking_no,
-      yamato_status:      o.yamato_status
-    });
-  } catch (e) {
+    const q = await pool.query(
+      `INSERT INTO trade_messages(trade_id, sender_id, content)
+       VALUES($1,$2,$3)
+       RETURNING id, trade_id, sender_id, content, created_at`,
+      [id, req.user.uid, content]
+    );
+
+    return res.status(201).json(q.rows[0]);
+  }catch(e){
     console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+    return res.status(500).json({error:'server_error'});
   }
 });
 
-
 const PORT = process.env.PORT || 4020;
-app.listen(PORT, ()=>console.log('listening on', PORT));
+app.listen(PORT, ()=>console.log('trade-svc listening on', PORT));

@@ -50,15 +50,19 @@ app.get('/health', (req,res)=>res.json({ok:true}));
 app.post('/login', async (req,res)=>{
   const { email, password } = req.body || {};
   if(!email || !password) return res.status(400).json({error:'bad_request'});
+
   try{
     const q = await pool.query(
       'SELECT id,email,password,role,disabled FROM users WHERE email=$1',
       [email]
     );
     if(q.rowCount === 0) return res.status(401).json({error:'invalid'});
+
     const u = q.rows[0];
     if(u.disabled) return res.status(403).json({error:'disabled'});
+
     if(u.password !== password) return res.status(401).json({error:'invalid'});
+
     const token = jwt.sign(
       { sub: u.email, role: u.role, uid: u.id },
       process.env.JWT_SECRET,
@@ -70,6 +74,7 @@ app.post('/login', async (req,res)=>{
     return res.status(500).json({error:'server_error'});
   }
 });
+
 
 // 新規登録
 app.post('/register', async (req, res) => {
@@ -99,23 +104,13 @@ app.post('/register', async (req, res) => {
   }
 
   try {
+    // ★ここが重要：戻り値を q に入れる
     const q = await pool.query(
       `INSERT INTO users
-        (email, password, role, disabled,
-         full_name, postal_code, prefecture, city, address_line, phone)
+        (email, password, role, disabled, full_name, postal_code, prefecture, city, address_line, phone)
        VALUES ($1,$2,$3,false,$4,$5,$6,$7,$8,$9)
        RETURNING id,email,role`,
-      [
-        email,
-        password,
-        'user',
-        fullName,
-        postalCode,
-        prefecture,
-        city,
-        addressLine,
-        phone
-      ]
+      [email, password, 'user', fullName, postalCode, prefecture, city, addressLine, phone]
     );
 
     const u = q.rows[0];
@@ -131,6 +126,7 @@ app.post('/register', async (req, res) => {
     return res.status(500).json({ error: 'server_error' });
   }
 });
+
 
 
 // 自分の情報取得
@@ -162,6 +158,31 @@ app.get('/admin/users', authRequired, adminRequired, async (req,res)=>{
     return res.status(500).json({error:'server_error'});
   }
 });
+
+app.get('/users/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad_id' });
+
+  try {
+    const q = await pool.query(
+      'SELECT id, email, full_name FROM users WHERE id=$1',
+      [id]
+    );
+    if (q.rowCount === 0) return res.status(404).json({ error: 'not_found' });
+    return res.json(q.rows[0]);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get("/users/:id", async (req,res) => {
+  const id = Number(req.params.id);
+  const q = await pool.query("SELECT id, email FROM users WHERE id=$1", [id]);
+  if(q.rowCount === 0) return res.status(404).json({error:"not_found"});
+  res.json(q.rows[0]);
+});
+
 
 // ユーザー凍結
 app.patch('/admin/users/:id/freeze', authRequired, adminRequired, async (req,res)=>{

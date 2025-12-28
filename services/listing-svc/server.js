@@ -1,373 +1,59 @@
-﻿// listing-svc/server.js
-import express from 'express';
+﻿import express from 'express';
 import cors from 'cors';
-import pg from 'pg';
 import jwt from 'jsonwebtoken';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import dotenv from 'dotenv';
-dotenv.config();
+import pg from 'pg';
+
+const { Pool } = pg;
 
 const app = express();
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
-// アップロード先ディレクトリ
-const uploadDir = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// multer 設定
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || '');
-    const base = path.basename(file.originalname || 'image', ext);
-    const safeBase = base.replace(/[^a-zA-Z0-9_\-]/g, '_');
-    cb(null, Date.now() + '_' + safeBase + ext);
-  }
-});
-const upload = multer({ storage });
-
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:3100'],
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false,
-  optionsSuccessStatus: 204
-}));
-app.options('*', (req, res) => res.sendStatus(204));
-
-app.use(express.json());
-
-// アップロード画像配信
-app.use('/uploads', express.static(uploadDir));
-
-const pool = new pg.Pool({
-  host:     process.env.DB_HOST,
-  user:     process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'myuser',
+  password: process.env.DB_PASSWORD || 'mypass',
+  database: process.env.DB_NAME || 'listingdb',
+  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432,
 });
 
-// 認証必須ミドルウェア
+const JWT_SECRET = process.env.JWT_SECRET || 'mysecret';
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || 'internal-secret';
+
+const FRUIT_IMAGE = {
+  1: '/fruits/apple.png',
+  2: '/fruits/banana.png',
+  3: '/fruits/orange.png',
+  4: '/fruits/grape.png',
+  5: '/fruits/strawberry.png'
+};
+
 function authRequired(req, res, next) {
-  const h = req.headers['authorization'] || '';
-  const [scheme, token] = h.split(' ');
-
-  if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) return res.status(401).json({ error: 'unauthorized' });
   try {
-    const payload = jwt.verify(
-      token,
-      process.env.JWT_SECRET || 'dev-secret'
-    );
-
-    console.log('authRequired decoded payload:', payload);
-
-    // auth-svc 側では { sub: email, role, uid } になっている想定
-    const userIdRaw = payload.uid ?? payload.id ?? payload.userId;
-
-    if (!userIdRaw || !Number.isFinite(Number(userIdRaw))) {
-      console.error('jwt payload has no valid user id', payload);
-      return res.status(401).json({ error: 'unauthorized' });
-    }
-
-    const emailFromPayload =
-      payload.email && typeof payload.email === 'string'
-        ? payload.email
-        : (typeof payload.sub === 'string' ? payload.sub : null);
-
-    req.user = {
-      id: Number(userIdRaw),
-      role: payload.role || 'user',
-      email: emailFromPayload
-    };
-
-    next();
-  } catch (e) {
-    console.error('jwt verify error', e);
+    const payload = jwt.verify(m[1], JWT_SECRET);
+    req.user = { id: payload.uid, role: payload.role || 'user' };
+    return next();
+  } catch {
     return res.status(401).json({ error: 'unauthorized' });
   }
 }
 
-app.get('/health', (req, res) =>
-  res.json({ ok: true, service: 'listing-svc' })
-);
+function internalRequired(req, res, next) {
+  const token = req.headers['x-internal-token'];
+  if (!token || token !== INTERNAL_TOKEN) {
+    return res.status(401).json({ error: 'unauthorized_internal' });
+  }
+  return next();
+}
 
-// 一覧取得＋検索・絞り込み
-app.get('/listings', async (req, res) => {
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.get('/catalog/items', async (_req, res) => {
   try {
-    const { q, category, fashion_genre, size } = req.query;
-
-    const conds = [];
-    const params = [];
-
-    if (q && q.trim()) {
-      params.push('%' + q.trim() + '%');
-      conds.push(`title ILIKE $${params.length}`);
-    }
-
-    if (category && category.trim()) {
-      params.push(category.trim());
-      conds.push(`category = $${params.length}`);
-    }
-
-    if (fashion_genre && fashion_genre.trim()) {
-      params.push(fashion_genre.trim());
-      conds.push(`fashion_genre = $${params.length}`);
-    }
-
-    if (size && size.trim()) {
-      params.push(size.trim());
-      conds.push(`size = $${params.length}`);
-    }
-
-    let sql = `
-      SELECT
-        id,
-        title,
-        price,
-        status,
-        seller_id,
-        image_url,
-        category,
-        fashion_genre,
-        size,
-        condition
-      FROM listings
-    `;
-
-    if (conds.length > 0) {
-      sql += ' WHERE ' + conds.join(' AND ');
-    }
-
-    sql += ' ORDER BY id DESC';
-
-    const { rows } = await pool.query(sql, params);
-    res.json(rows);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'failed to fetch listings' });
-  }
-});
-
-// 単一出品（商品詳細）
-app.get('/listings/:id', async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
-  try {
-    const r = await pool.query(
-      `SELECT id,title,price,status,seller_id,
-              image_url,condition,category,fashion_genre,size
-         FROM listings
-        WHERE id=$1`,
-      [id]
-    );
-    if (r.rowCount === 0) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-    return res.json(r.rows[0]);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// 商品ごとのコメント一覧
-app.get('/listings/:id/comments', async (req, res) => {
-  const listingId = Number(req.params.id);
-  if (!Number.isInteger(listingId)) {
-    return res.status(400).json({ error: 'invalid listing id' });
-  }
-
-  try {
-    const result = await pool.query(
-      `
-      SELECT
-        c.id,
-        c.body,
-        c.created_at,
-        c.author_id,
-        u.email AS author_email
-      FROM listing_comments c
-      LEFT JOIN users u
-        ON c.author_id = u.id
-      WHERE c.listing_id = $1
-      ORDER BY c.created_at ASC
-      `,
-      [listingId]
-    );
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('GET /listings/:id/comments error', err);
-    res.status(500).json({ error: 'failed to fetch comments' });
-  }
-});
-
-// 商品にコメントを追加（ログイン必須）
-app.post('/listings/:id/comments', authRequired, async (req, res) => {
-  const listingId = Number(req.params.id);
-  if (!Number.isInteger(listingId)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
-
-  const body = (req.body && req.body.body || '').trim();
-  if (!body) {
-    return res.status(400).json({ error: 'body_required' });
-  }
-
-  try {
-    // 該当商品が存在するか確認
-    const lr = await pool.query(
-      'SELECT id FROM listings WHERE id=$1',
-      [listingId]
-    );
-    if (lr.rowCount === 0) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-
-    const r = await pool.query(
-      `INSERT INTO listing_comments(listing_id,author_id,body)
-       VALUES ($1,$2,$3)
-       RETURNING id,body,created_at,author_id`,
-      [listingId, req.user.id, body]
-    );
-    const c = r.rows[0];
-
-    const ur = await pool.query(
-      'SELECT email FROM users WHERE id=$1',
-      [c.author_id]
-    );
-    const authorEmail = ur.rowCount ? ur.rows[0].email : null;
-
-    return res.status(201).json({
-      id: c.id,
-      body: c.body,
-      created_at: c.created_at,
-      author_id: c.author_id,
-      author_email: authorEmail
-    });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// 出品の再編集（出品者または管理者のみ）
-app.put('/listings/:id', authRequired, upload.single('image'), async (req, res) => {
-  const listingId = Number(req.params.id);
-  if (!Number.isInteger(listingId)) {
-    return res.status(400).json({ error: 'invalid id' });
-  }
-
-  const client = await pool.connect();
-  try {
-    const result = await client.query(
-      'SELECT * FROM listings WHERE id = $1',
-      [listingId]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'not found' });
-    }
-
-    const listing = result.rows[0];
-
-    console.log('UPDATE /listings/:id debug', {
-      listingId,
-      listing_seller_id: listing.seller_id,
-      req_user: req.user
-    });
-
-    const isOwner = Number(listing.seller_id) === Number(req.user.id);
-    const isAdmin = req.user.role === 'admin';
-
-    if (!isOwner && !isAdmin) {
-      console.log('FORBIDDEN update', {
-        listingId,
-        listing_seller_id: listing.seller_id,
-        user_id: req.user.id,
-        role: req.user.role
-      });
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    const { title, price, condition, category, fashion_genre, size } = req.body;
-
-    const fields = [];
-    const values = [];
-    let idx = 1;
-
-    if (title !== undefined) {
-      fields.push(`title = $${idx++}`);
-      values.push(title);
-    }
-    if (price !== undefined) {
-      fields.push(`price = $${idx++}`);
-      values.push(Number(price));
-    }
-    if (condition !== undefined) {
-      fields.push(`condition = $${idx++}`);
-      values.push(condition);
-    }
-    if (category !== undefined) {
-      fields.push(`category = $${idx++}`);
-      values.push(category);
-    }
-    if (fashion_genre !== undefined) {
-      fields.push(`fashion_genre = $${idx++}`);
-      values.push(fashion_genre);
-    }
-    if (size !== undefined) {
-      fields.push(`size = $${idx++}`);
-      values.push(size);
-    }
-
-    if (req.file) {
-      const imagePath = '/uploads/' + req.file.filename;
-      fields.push(`image_url = $${idx++}`);
-      values.push(imagePath);
-    }
-
-    if (fields.length === 0) {
-      return res.status(400).json({ error: 'no fields to update' });
-    }
-
-    values.push(listingId);
-
-    const updateSql = `
-      UPDATE listings
-         SET ${fields.join(', ')}
-       WHERE id = $${idx}
-       RETURNING *
-    `;
-
-    const updated = await client.query(updateSql, values);
-    return res.json(updated.rows[0]);
-  } catch (e) {
-    console.error('update listing error', e);
-    return res.status(500).json({ error: 'internal error' });
-  } finally {
-    client.release();
-  }
-});
-
-// 自分の出品一覧
-app.get('/listings/mine', authRequired, async (req, res) => {
-  try {
-    const r = await pool.query(
-      `SELECT id,title,price,status,seller_id,
-              image_url,condition,category,fashion_genre,size
-         FROM listings
-        WHERE seller_id = $1
-        ORDER BY id DESC`,
-      [req.user.id]
-    );
+    const r = await pool.query('SELECT id, name FROM fruit_items ORDER BY id ASC');
     return res.json(r.rows);
   } catch (e) {
     console.error(e);
@@ -375,178 +61,362 @@ app.get('/listings/mine', authRequired, async (req, res) => {
   }
 });
 
-// 新規出品
-app.post('/listings', authRequired, upload.single('image'), async (req, res) => {
-  const { title, price, condition, category, fashion_genre, size } = req.body || {};
-  const file = req.file;
+async function attachWants(listings) {
+  const ids = listings.map((x) => x.id).filter((x) => Number.isInteger(x));
+  if (ids.length === 0) return listings.map((x) => ({ ...x, wants: [] }));
 
-  if (!title || price == null || !condition || !category) {
-    return res.status(400).json({ error: 'bad_request' });
-  }
-  if (!file) {
-    return res.status(400).json({ error: 'image_required' });
-  }
+  const r = await pool.query(
+    `SELECT lw.listing_id, fi.id AS fruit_item_id, fi.name
+       FROM listing_wants lw
+       JOIN fruit_items fi ON fi.id = lw.fruit_item_id
+      WHERE lw.listing_id = ANY($1::int[])
+      ORDER BY lw.listing_id ASC, fi.id ASC`,
+    [ids]
+  );
 
-  const priceNum = Number(price);
-  if (!Number.isFinite(priceNum) || priceNum <= 0) {
-    return res.status(400).json({ error: 'bad_price' });
-  }
-
-  const cat = category;
-  const isFashion = (cat === 'ファッション');
-  if (isFashion) {
-    if (!fashion_genre || !fashion_genre.trim()) {
-      return res.status(400).json({ error: 'fashion_genre_required' });
-    }
-    if (!size || !size.trim()) {
-      return res.status(400).json({ error: 'size_required' });
-    }
+  const map = new Map();
+  for (const row of r.rows) {
+    const key = Number(row.listing_id);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({ id: Number(row.fruit_item_id), name: row.name });
   }
 
-  const imagePath = '/uploads/' + path.basename(file.path);
+  return listings.map((x) => ({
+    ...x,
+    wants: map.get(Number(x.id)) || []
+  }));
+}
 
+app.get('/listings', async (req, res) => {
+  const fruitId = req.query.fruit_item_id ? Number(req.query.fruit_item_id) : null;
+  const wantId = req.query.want_id ? Number(req.query.want_id) : null;
+
+  const where = [];
+  const vals = [];
+  let idx = 1;
+
+  if (Number.isInteger(fruitId)) {
+    where.push(`l.fruit_item_id = $${idx++}`);
+    vals.push(fruitId);
+  }
+
+  if (Number.isInteger(wantId)) {
+    where.push(`EXISTS (SELECT 1 FROM listing_wants lw WHERE lw.listing_id = l.id AND lw.fruit_item_id = $${idx++})`);
+    vals.push(wantId);
+  }
+
+  const sql = `
+    SELECT
+      l.id,
+      l.fruit_item_id,
+      fi.name AS fruit_name,
+      l.quantity,
+      l.status,
+      l.seller_id,
+      l.image_url,
+      l.description,
+      l.created_at
+    FROM listings l
+    JOIN fruit_items fi ON fi.id = l.fruit_item_id
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY l.id DESC
+    LIMIT 200
+  `;
+
+  try {
+    const r = await pool.query(sql, vals);
+    const out = await attachWants(r.rows);
+    return res.json(out);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/listings/:id(\\d+)', authRequired, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad_id' });
+  try {
+    const r = await pool.query(
+      `SELECT l.id, l.fruit_item_id, fi.name AS fruit_name, l.quantity, l.status, l.seller_id,
+              l.image_url, l.description, l.created_at
+         FROM listings l
+         JOIN fruit_items fi ON fi.id = l.fruit_item_id
+        WHERE l.id = $1`,
+      [id]
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'not_found' });
+    const out = (await attachWants([r.rows[0]]))[0];
+    return res.json(out);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/listings/mine', authRequired, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT l.id, l.fruit_item_id, fi.name AS fruit_name, l.quantity, l.status, l.seller_id,
+              l.image_url, l.description, l.created_at
+         FROM listings l
+         JOIN fruit_items fi ON fi.id = l.fruit_item_id
+        WHERE l.seller_id = $1
+        ORDER BY l.id DESC`,
+      [req.user.id]
+    );
+    const out = await attachWants(r.rows);
+    return res.json(out);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/listings/mine', authRequired, async (req, res) => {
   try {
     const q = await pool.query(
-      `INSERT INTO listings
-       (title,price,status,seller_id,image_url,condition,category,fashion_genre,size)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING id,title,price,status,seller_id,
-                 image_url,condition,category,fashion_genre,size`,
-      [
-        title,
-        priceNum,
-        'Active',
-        req.user.id,
-        imagePath,
-        condition,
-        category,
-        fashion_genre || null,
-        size || null
-      ]
+      `SELECT id, fruit_item_id, quantity, status, seller_id, image_url, description
+         FROM listings
+        WHERE seller_id = $1
+        ORDER BY id DESC`,
+      [req.user.id]
     );
-    return res.status(201).json(q.rows[0]);
+    return res.json(q.rows);
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: 'server_error' });
   }
 });
 
-// 出品削除（出品者本人 または admin）
-app.delete('/listings/:id', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
+
+
+app.post('/listings', authRequired, async (req, res) => {
+  const fruit_item_id = Number(req.body?.fruit_item_id);
+  const quantity = Number(req.body?.quantity);
+  const wantIdsRaw = Array.isArray(req.body?.want_fruit_item_ids) ? req.body.want_fruit_item_ids : [];
+  const description = (req.body?.description || '').toString().trim();
+
+  if (!Number.isInteger(fruit_item_id) || fruit_item_id < 1 || fruit_item_id > 5) {
+    return res.status(400).json({ error: 'bad_fruit_item_id' });
+  }
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    return res.status(400).json({ error: 'bad_quantity' });
   }
 
+  const wantIds = [...new Set(wantIdsRaw.map(Number).filter((x) => Number.isInteger(x) && x >= 1 && x <= 5))];
+  if (wantIds.length === 0) return res.status(400).json({ error: 'wants_required' });
+  if (wantIds.length > 3) return res.status(400).json({ error: 'too_many_wants' });
+
+  const image_url = FRUIT_IMAGE[fruit_item_id] || '/fruits/apple.png';
+
+  const client = await pool.connect();
   try {
-    const r = await pool.query(
-      `SELECT id,seller_id,status,image_url FROM listings WHERE id=$1`,
-      [id]
+    await client.query('BEGIN');
+
+    const ins = await client.query(
+      `INSERT INTO listings (fruit_item_id, quantity, status, seller_id, image_url, description)
+       VALUES ($1,$2,'Active',$3,$4,$5)
+       RETURNING id, fruit_item_id, quantity, status, seller_id, image_url, description, created_at`,
+      [fruit_item_id, quantity, req.user.id, image_url, description || null]
     );
-    if (r.rowCount === 0) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-    const l = r.rows[0];
 
-    if (req.user.role !== 'admin' && Number(l.seller_id) !== Number(req.user.id)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    if (l.status !== 'Active') {
-      return res.status(409).json({ error: 'not_active' });
-    }
+    const listingId = ins.rows[0].id;
 
-    await pool.query('DELETE FROM listings WHERE id=$1', [id]);
-
-    if (l.image_url) {
-      const full = path.join(
-        process.cwd(),
-        l.image_url.replace(/^\/uploads\//, 'uploads/')
+    for (const wid of wantIds) {
+      await client.query(
+        `INSERT INTO listing_wants (listing_id, fruit_item_id)
+         VALUES ($1,$2)
+         ON CONFLICT DO NOTHING`,
+        [listingId, wid]
       );
-      fs.unlink(full, () => {});
     }
 
-    return res.json({ ok: true });
+    await client.query('COMMIT');
+    const out = await attachWants([
+      {
+        ...ins.rows[0],
+        fruit_name: (await client.query('SELECT name FROM fruit_items WHERE id=$1', [fruit_item_id])).rows[0]?.name || ''
+      }
+    ]);
+    return res.status(201).json(out[0]);
   } catch (e) {
+    await client.query('ROLLBACK');
     console.error(e);
     return res.status(500).json({ error: 'server_error' });
+  } finally {
+    client.release();
   }
 });
 
-// 出品停止（Active -> Paused）
-app.patch('/listings/:id/pause', authRequired, async (req, res) => {
+app.put('/listings/:id', authRequired, async (req, res) => {
   const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
-  }
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad_id' });
 
+  const fruit_item_id = req.body?.fruit_item_id != null ? Number(req.body.fruit_item_id) : null;
+  const quantity = req.body?.quantity != null ? Number(req.body.quantity) : null;
+  const wantIdsRaw = Array.isArray(req.body?.want_fruit_item_ids) ? req.body.want_fruit_item_ids : null;
+  const description = req.body?.description != null ? (req.body.description || '').toString().trim() : null;
+
+  const client = await pool.connect();
   try {
-    const r = await pool.query(
-      `SELECT id,seller_id,status FROM listings WHERE id=$1`,
-      [id]
-    );
-    if (r.rowCount === 0) {
+    await client.query('BEGIN');
+    const cur = await client.query('SELECT * FROM listings WHERE id=$1 FOR UPDATE', [id]);
+    if (cur.rowCount === 0) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ error: 'not_found' });
     }
-    const l = r.rows[0];
-
-    if (req.user.role !== 'admin' && Number(l.seller_id) !== Number(req.user.id)) {
+    const row = cur.rows[0];
+    if (Number(row.seller_id) !== Number(req.user.id)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ error: 'forbidden' });
     }
-    if (l.status !== 'Active') {
-      return res.status(409).json({ error: 'invalid_status' });
+
+    const fields = [];
+    const vals = [];
+    let idx = 1;
+
+    let nextFruitId = Number(row.fruit_item_id);
+    if (fruit_item_id != null) {
+      if (!Number.isInteger(fruit_item_id) || fruit_item_id < 1 || fruit_item_id > 5) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'bad_fruit_item_id' });
+      }
+      nextFruitId = fruit_item_id;
+      fields.push(`fruit_item_id = $${idx++}`);
+      vals.push(fruit_item_id);
+      fields.push(`image_url = $${idx++}`);
+      vals.push(FRUIT_IMAGE[fruit_item_id] || '/fruits/apple.png');
     }
 
-    const u = await pool.query(
-      `UPDATE listings
-          SET status='Paused'
-        WHERE id=$1
-      RETURNING id,title,price,status,seller_id,
-                image_url,condition,category,fashion_genre,size`,
+    if (quantity != null) {
+      if (!Number.isInteger(quantity) || quantity < 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'bad_quantity' });
+      }
+      fields.push(`quantity = $${idx++}`);
+      vals.push(quantity);
+      fields.push(`status = $${idx++}`);
+      vals.push(quantity === 0 ? 'Traded' : 'Active');
+    }
+
+    if (description != null) {
+      fields.push(`description = $${idx++}`);
+      vals.push(description || null);
+    }
+
+    if (fields.length > 0) {
+      fields.push(`updated_at = now()`);
+      vals.push(id);
+      await client.query(`UPDATE listings SET ${fields.join(', ')} WHERE id = $${idx}`, vals);
+    }
+
+    if (wantIdsRaw != null) {
+      const wantIds = [...new Set(wantIdsRaw.map(Number).filter((x) => Number.isInteger(x) && x >= 1 && x <= 5))];
+      if (wantIds.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'wants_required' });
+      }
+      if (wantIds.length > 3) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'too_many_wants' });
+      }
+      await client.query('DELETE FROM listing_wants WHERE listing_id=$1', [id]);
+      for (const wid of wantIds) {
+        await client.query(
+          `INSERT INTO listing_wants(listing_id, fruit_item_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+          [id, wid]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    const out = await pool.query(
+      `SELECT l.id, l.fruit_item_id, fi.name AS fruit_name, l.quantity, l.status, l.seller_id,
+              l.image_url, l.description, l.created_at
+         FROM listings l
+         JOIN fruit_items fi ON fi.id = l.fruit_item_id
+        WHERE l.id=$1`,
       [id]
     );
-    return res.json(u.rows[0]);
+    const result = (await attachWants(out.rows))[0];
+    return res.json(result);
   } catch (e) {
+    await client.query('ROLLBACK');
     console.error(e);
     return res.status(500).json({ error: 'server_error' });
+  } finally {
+    client.release();
   }
 });
 
-// 出品再開（Paused -> Active）
-app.patch('/listings/:id/activate', authRequired, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
-    return res.status(400).json({ error: 'bad_id' });
+// trade-svc からの在庫減算（成立時）
+app.post('/internal/listings/decrease', internalRequired, async (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : null;
+  if (!items || items.length === 0) return res.status(400).json({ error: 'items_required' });
+
+  for (const it of items) {
+    const listingId = Number(it.listing_id);
+    const qty = Number(it.quantity);
+    if (!Number.isInteger(listingId) || !Number.isInteger(qty) || qty <= 0) {
+      return res.status(400).json({ error: 'bad_items' });
+    }
   }
 
+  const client = await pool.connect();
   try {
-    const r = await pool.query(
-      `SELECT id,seller_id,status FROM listings WHERE id=$1`,
-      [id]
-    );
-    if (r.rowCount === 0) {
-      return res.status(404).json({ error: 'not_found' });
-    }
-    const l = r.rows[0];
+    await client.query('BEGIN');
+    const updated = [];
 
-    if (req.user.role !== 'admin' && Number(l.seller_id) !== Number(req.user.id)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-    if (l.status !== 'Paused') {
-      return res.status(409).json({ error: 'invalid_status' });
+    for (const it of items) {
+      const listingId = Number(it.listing_id);
+      const dec = Number(it.quantity);
+
+      const r = await client.query(
+        `SELECT id, quantity, status
+           FROM listings
+          WHERE id = $1
+          FOR UPDATE`,
+        [listingId]
+      );
+      if (r.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'listing_not_found', listing_id: listingId });
+      }
+
+      const row = r.rows[0];
+      if (row.status !== 'Active') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'listing_not_active', listing_id: listingId });
+      }
+      if (Number(row.quantity) < dec) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'insufficient_stock', listing_id: listingId });
+      }
+
+      const newQty = Number(row.quantity) - dec;
+      const newStatus = newQty === 0 ? 'Traded' : 'Active';
+
+      const u = await client.query(
+        `UPDATE listings
+            SET quantity = $1,
+                status   = $2,
+                updated_at = now()
+          WHERE id = $3
+        RETURNING id, quantity, status`,
+        [newQty, newStatus, listingId]
+      );
+      updated.push(u.rows[0]);
     }
 
-    const u = await pool.query(
-      `UPDATE listings
-          SET status='Active'
-        WHERE id=$1
-      RETURNING id,title,price,status,seller_id,
-                image_url,condition,category,fashion_genre,size`,
-      [id]
-    );
-    return res.json(u.rows[0]);
+    await client.query('COMMIT');
+    return res.json({ ok: true, updated });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
+    await client.query('ROLLBACK');
+    console.error('internal decrease error', e);
+    return res.status(500).json({ error: 'internal_error' });
+  } finally {
+    client.release();
   }
 });
 
