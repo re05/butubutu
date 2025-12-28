@@ -43,6 +43,8 @@ export const tradeApi = {
   reject: (id) => request(`/trades/${id}/reject`, { method: "PATCH" }),
   ship: (id) => request(`/trades/${id}/ship`, { method: "PATCH" }),
   received: (id) => request(`/trades/${id}/received`, { method: "PATCH" }),
+  updateItems: (id, give_items, take_items) =>
+  request(`/trades/${id}/items`, { method: "PATCH", body: { give_items, take_items } }),
   messages: (id) => request(`/trades/${id}/messages`),
   postMessage: (id, content) => request(`/trades/${id}/messages`, { method: "POST", body: { content } }),
 };

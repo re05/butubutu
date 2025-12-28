@@ -425,6 +425,88 @@ app.patch('/trades/:id/reject', authRequired, async (req,res)=>{
 });
 
 /**
+ * 提案内容（数量）を更新（提案者だけ / Proposed の間だけ）
+ * body:
+ * { give_items:[{listing_id, quantity}], take_items:[{listing_id, quantity}] }
+ */
+app.patch('/trades/:id/items', authRequired, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'bad_id' });
+
+  const give_items = Array.isArray(req.body?.give_items) ? req.body.give_items : null;
+  const take_items = Array.isArray(req.body?.take_items) ? req.body.take_items : null;
+  if (!give_items?.length) return res.status(400).json({ error: 'give_items_required' });
+  if (!take_items?.length) return res.status(400).json({ error: 'take_items_required' });
+
+  // 数値チェック
+  for (const it of [...give_items, ...take_items]) {
+    const lid = Number(it?.listing_id);
+    const q = Number(it?.quantity);
+    if (!Number.isInteger(lid) || lid <= 0) return res.status(400).json({ error: 'bad_listing_id' });
+    if (!Number.isInteger(q) || q <= 0) return res.status(400).json({ error: 'bad_quantity' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const t = await client.query(
+      `SELECT id, proposer_id, receiver_id, status
+         FROM trades
+        WHERE id = $1
+        FOR UPDATE`,
+      [id]
+    );
+    if (t.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const trade = t.rows[0];
+
+    // 提案者だけ
+    if (Number(trade.proposer_id) !== Number(req.user.uid)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    // 承諾前だけ
+    if (trade.status !== 'Proposed') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'bad_status', status: trade.status });
+    }
+
+    // 既存を消して入れ直す
+    await client.query(`DELETE FROM trade_items WHERE trade_id = $1`, [id]);
+
+    for (const it of give_items) {
+      await client.query(
+        `INSERT INTO trade_items(trade_id, side, listing_id, quantity)
+         VALUES ($1, 'give', $2, $3)`,
+        [id, Number(it.listing_id), Number(it.quantity)]
+      );
+    }
+    for (const it of take_items) {
+      await client.query(
+        `INSERT INTO trade_items(trade_id, side, listing_id, quantity)
+         VALUES ($1, 'take', $2, $3)`,
+        [id, Number(it.listing_id), Number(it.quantity)]
+      );
+    }
+
+    await client.query('COMMIT');
+    return res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
+  } finally {
+    client.release();
+  }
+});
+
+
+
+/**
  * 発送した（当事者だけ）
  * Accepted / Shipping の間で押せる
  * 押した人の shipped_*_at を埋め、status を Shipping にする
@@ -461,10 +543,6 @@ app.patch('/trades/:id/ship', authRequired, async (req,res)=>{
       return res.status(403).json({error:'forbidden'});
     }
 
-    if (trade.status !== 'Accepted' && trade.status !== 'Shipping') {
-      await client.query('ROLLBACK');
-      return res.status(409).json({error:'bad_status', status: trade.status});
-    }
 
     const isProposer = Number(trade.proposer_id) === uid;
     const col = isProposer ? 'shipped_proposer_at' : 'shipped_receiver_at';
@@ -593,8 +671,10 @@ app.get('/trades/:id/messages', authRequired, async (req,res)=>{
       }
     }
 
-    if (trade.status !== 'Accepted' && trade.status !== 'Shipping' && trade.status !== 'Completed') {
-      return res.status(409).json({error:'not_accepted_yet', status: trade.status});
+    // 承諾前(Proposed)でもチャット可能にする（Rejected だけ不可にする）
+    const chatOk = ['Proposed', 'Accepted', 'Shipping', 'Completed'];
+    if (!chatOk.includes(trade.status)) {
+      return res.status(409).json({ error: 'chat_not_allowed', status: trade.status });
     }
 
 
@@ -636,10 +716,11 @@ app.post('/trades/:id/messages', authRequired, async (req,res)=>{
     if (trade.proposer_id !== req.user.uid && trade.receiver_id !== req.user.uid) {
       return res.status(403).json({error:'forbidden'});
     }
-    if (trade.status !== 'Accepted' && trade.status !== 'Shipping' && trade.status !== 'Completed') {
-      return res.status(409).json({error:'not_accepted_yet', status: trade.status});
+    // 承諾前(Proposed)でもチャット可能にする（Rejected だけ不可にする）
+    const chatOk = ['Proposed', 'Accepted', 'Shipping', 'Completed'];
+    if (!chatOk.includes(trade.status)) {
+      return res.status(409).json({ error: 'chat_not_allowed', status: trade.status });
     }
-
 
     const q = await pool.query(
       `INSERT INTO trade_messages(trade_id, sender_id, content)
