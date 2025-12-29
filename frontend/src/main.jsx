@@ -13,6 +13,8 @@ import {
 import Trades from "./Trades.jsx";
 import TradeDetail from "./TradeDetail.jsx";
 import TradeNew from "./TradeNew.jsx";
+import FxRates from "./FxRates.jsx";
+
 
 const AUTH_URL = import.meta.env.VITE_AUTH_URL || "http://localhost:4100";
 const LISTING_URL = import.meta.env.VITE_LISTING_URL || "http://localhost:4110";
@@ -94,7 +96,8 @@ function Layout({ children }) {
         <Link to="/">マイページ</Link>
         <Link to="/listings">出品一覧</Link>
         <Link to="/sell">出品</Link>
-        <Link to="/trades">取引（提案）</Link>
+        <Link to="/trades">取引</Link>
+        <Link to="/fx">相場</Link>
 
         <span style={{ marginLeft: "auto" }} />
         {!loaded ? <span>読込中...</span> : null}
@@ -758,6 +761,17 @@ const router = createBrowserRouter([
       </RequireAuth>
     ),
   },
+    {
+    path: "/fx",
+    element: (
+      <RequireAuth>
+        <Layout>
+          <FxRates />
+        </Layout>
+      </RequireAuth>
+    ),
+  },
+
 
 ]);
 

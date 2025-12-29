@@ -100,27 +100,71 @@ async function decreaseStockViaListingSvc(items) {
 async function fetchListingSummaryViaListingSvc(ids) {
   const base = process.env.LISTING_SVC_URL || 'http://listing-svc:4010';
   const token = process.env.INTERNAL_TOKEN || '';
-  if (!token) {
-    return { ok: false, status: 500, error: { error: 'missing_internal_token' } };
-  }
-
   const resp = await postJson(
     `${base}/internal/listings/summary`,
     { 'X-Internal-Token': token },
     { ids }
   );
-
-  if (resp.status >= 200 && resp.status < 300) {
-    const listings = Array.isArray(resp.json?.listings) ? resp.json.listings : [];
-    const missing = Array.isArray(resp.json?.missing) ? resp.json.missing : [];
-    return { ok: true, status: resp.status, data: { listings, missing } };
+  if (!(resp.status >= 200 && resp.status < 300)) {
+    throw new Error(`listing_summary_failed status=${resp.status} body=${resp.text}`);
   }
-  return {
-    ok: false,
-    status: resp.status || 500,
-    error: resp.json || { error: 'listing_summary_failed', detail: resp.text }
-  };
+  return resp.json;
 }
+
+async function postFxTrade(payload) {
+  const base = process.env.FX_SVC_URL || 'http://fx-svc:4030';
+  const token = process.env.INTERNAL_TOKEN || '';
+  const resp = await postJson(
+    `${base}/internal/fx/trades`,
+    { 'X-Internal-Token': token },
+    payload
+  );
+  if (!(resp.status >= 200 && resp.status < 300)) {
+    throw new Error(`fx_post_failed status=${resp.status} body=${resp.text}`);
+  }
+  return resp.json;
+}
+
+async function buildFxPayloadFromTrade(tradeId) {
+  const r = await pool.query(
+    `SELECT side, listing_id, quantity
+       FROM trade_items
+      WHERE trade_id=$1`,
+    [tradeId]
+  );
+  const rows = r.rows || [];
+  const give = rows.filter((x) => x.side === 'give');
+  const take = rows.filter((x) => x.side === 'take');
+  if (give.length === 0 || take.length === 0) throw new Error('fx_items_missing');
+
+  const ids = [...new Set(rows.map((x) => Number(x.listing_id)))];
+  const sum = await fetchListingSummaryViaListingSvc(ids);
+  if (Array.isArray(sum?.missing) && sum.missing.length) {
+    throw new Error(`fx_missing_listing_ids=${sum.missing.join(',')}`);
+  }
+
+  const map = new Map((sum.listings || []).map((x) => [Number(x.id), x]));
+
+  const giveFruitIds = new Set(give.map((it) => Number(map.get(Number(it.listing_id))?.fruit_item_id)));
+  const takeFruitIds = new Set(take.map((it) => Number(map.get(Number(it.listing_id))?.fruit_item_id)));
+  if (giveFruitIds.size !== 1 || takeFruitIds.size !== 1) throw new Error('fx_requires_single_fruit_each_side');
+
+  const from_fruit_item_id = [...giveFruitIds][0];
+  const to_fruit_item_id = [...takeFruitIds][0];
+  if (!from_fruit_item_id || !to_fruit_item_id || from_fruit_item_id === to_fruit_item_id) throw new Error('fx_bad_fruits');
+
+  const from_qty = give.reduce((s, it) => s + Number(it.quantity), 0);
+  const to_qty = take.reduce((s, it) => s + Number(it.quantity), 0);
+  if (!Number.isInteger(from_qty) || from_qty <= 0 || !Number.isInteger(to_qty) || to_qty <= 0) throw new Error('fx_bad_qty');
+
+  const t = await pool.query(`SELECT completed_at FROM trades WHERE id=$1`, [tradeId]);
+  const completed_at = t.rows?.[0]?.completed_at || new Date().toISOString();
+
+  return { trade_id: tradeId, from_fruit_item_id, to_fruit_item_id, from_qty, to_qty, completed_at };
+}
+
+
+
 
 async function validateTradeItemOwnership({ give_items, take_items, proposer_id, receiver_id }) {
   const ids = [...new Set([...give_items, ...take_items].map((x) => Number(x.listing_id)))];
@@ -195,6 +239,14 @@ async function validateTradeItemOwnership({ give_items, take_items, proposer_id,
   }
 
   return { ok: true, status: 200 };
+}
+
+function internalRequired(req, res, next) {
+  const token = (req.header('X-Internal-Token') || '').toString();
+  if (!token || token !== (process.env.INTERNAL_TOKEN || '')) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  next();
 }
 
 
@@ -711,79 +763,94 @@ app.patch('/trades/:id/ship', authRequired, async (req,res)=>{
 });
 
 /**
- * 到着通知（Shipping で、両者発送済みの時だけ）
- * 両者到着済みになったら Completed にする
+ * 到着通知
  */
-app.patch('/trades/:id/received', authRequired, async (req,res)=>{
+app.patch('/trades/:id/received', authRequired, async (req, res) => {
   const id = Number(req.params.id);
-  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'bad_id' });
 
-  const uid = Number(req.user?.uid || 0);
+  const uid = Number(req.user.uid);
 
   const client = await pool.connect();
-  try{
+  try {
     await client.query('BEGIN');
 
-    const t = await client.query(
-      `SELECT *
-         FROM trades
-        WHERE id = $1
-        FOR UPDATE`,
-      [id]
-    );
-    if(t.rowCount === 0){
-      await client.query('ROLLBACK');
-      return res.status(404).json({error:'not_found'});
-    }
+    const t = await client.query(`SELECT * FROM trades WHERE id=$1 FOR UPDATE`, [id]);
     const trade = t.rows[0];
-
-    if (Number(trade.proposer_id) !== uid && Number(trade.receiver_id) !== uid && req.user.role !== 'admin') {
+    if (!trade) {
       await client.query('ROLLBACK');
-      return res.status(403).json({error:'forbidden'});
+      return res.status(404).json({ error: 'not_found' });
     }
 
-    if (trade.status !== 'Shipping') {
+    const proposerId = Number(trade.proposer_id);
+    const receiverId = Number(trade.receiver_id);
+
+    const isProposer = uid === proposerId;
+    const isReceiver = uid === receiverId;
+    if (!isProposer && !isReceiver) {
       await client.query('ROLLBACK');
-      return res.status(409).json({error:'bad_status', status: trade.status});
+      return res.status(403).json({ error: 'forbidden' });
     }
 
-    if (!trade.shipped_proposer_at || !trade.shipped_receiver_at) {
+    // 受取確認は「相手が発送していること」が条件
+    const myReceivedCol = isProposer ? 'received_proposer_at' : 'received_receiver_at';
+    const otherShippedCol = isProposer ? 'shipped_receiver_at' : 'shipped_proposer_at';
+
+    if (!trade[otherShippedCol]) {
       await client.query('ROLLBACK');
-      return res.status(409).json({error:'not_both_shipped'});
+      return res.status(409).json({ error: 'other_not_shipped_yet' });
     }
 
-    const isProposer = Number(trade.proposer_id) === uid;
-    const col = isProposer ? 'received_proposer_at' : 'received_receiver_at';
-    if (trade[col]) {
+    if (trade[myReceivedCol]) {
       await client.query('ROLLBACK');
-      return res.status(409).json({error:'already_received'});
+      return res.status(409).json({ error: 'already_received' });
     }
 
-    const u1 = await client.query(
-      `UPDATE trades SET ${col}=now() WHERE id=$1 RETURNING *`,
-      [id]
+    // ステータスは Shipping に寄せる（Accepted のままでも整合が崩れないように）
+    const now = new Date();
+    await client.query(
+      `UPDATE trades
+          SET ${myReceivedCol} = $2,
+              status = CASE WHEN status='Accepted' THEN 'Shipping' ELSE status END
+        WHERE id=$1`,
+      [id, now]
     );
-    const after = u1.rows[0];
 
-    let finalRow = after;
-    if (after.received_proposer_at && after.received_receiver_at) {
-      const u2 = await client.query(
+    // 両方が受取確認したら Completed
+    const t2 = await client.query(`SELECT * FROM trades WHERE id=$1`, [id]);
+    let finalRow = t2.rows[0];
+
+    if (finalRow.received_proposer_at && finalRow.received_receiver_at && finalRow.status !== 'Completed') {
+      const c = await client.query(
         `UPDATE trades SET status='Completed', completed_at=now() WHERE id=$1 RETURNING *`,
         [id]
       );
-      finalRow = u2.rows[0];
+      finalRow = c.rows[0];
     }
 
     await client.query('COMMIT');
+
+    // Completed になったら為替実績を登録（失敗しても取引自体は成立させる）
+    if (finalRow?.status === 'Completed') {
+      try {
+        const payload = await buildFxPayloadFromTrade(id);
+        await postFxTrade(payload);
+      } catch (e) {
+        console.error('fx_post_error', e);
+      }
+    }
+
     return res.json(finalRow);
-  }catch(e){
+
+  } catch (e) {
     await client.query('ROLLBACK');
     console.error(e);
-    return res.status(500).json({error:'server_error'});
-  }finally{
+    return res.status(500).json({ error: 'server_error' });
+  } finally {
     client.release();
   }
 });
+
 
 
 
@@ -874,6 +941,25 @@ app.post('/trades/:id/messages', authRequired, async (req,res)=>{
     return res.status(500).json({error:'server_error'});
   }
 });
+
+app.post('/internal/fx/backfill', internalRequired, async (req, res) => {
+  const ids = Array.isArray(req.body?.trade_ids) ? req.body.trade_ids : [];
+  const tradeIds = [...new Set(ids.map(Number).filter((x) => Number.isInteger(x) && x > 0))];
+  if (tradeIds.length === 0) return res.status(400).json({ error: 'trade_ids_required' });
+
+  const results = [];
+  for (const id of tradeIds) {
+    try {
+      const payload = await buildFxPayloadFromTrade(id);
+      await postFxTrade(payload);
+      results.push({ trade_id: id, ok: true });
+    } catch (e) {
+      results.push({ trade_id: id, ok: false, error: String(e?.message || e) });
+    }
+  }
+  return res.json({ results });
+});
+
 
 const PORT = process.env.PORT || 4020;
 app.listen(PORT, ()=>console.log('trade-svc listening on', PORT));

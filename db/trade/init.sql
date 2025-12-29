@@ -7,8 +7,14 @@ CREATE TABLE IF NOT EXISTS trades (
   status TEXT NOT NULL DEFAULT 'Proposed',
   proposal_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  accepted_at TIMESTAMPTZ
+  accepted_at TIMESTAMPTZ,
+  shipped_proposer_at TIMESTAMPTZ,
+  shipped_receiver_at TIMESTAMPTZ,
+  received_proposer_at TIMESTAMPTZ,
+  received_receiver_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ
 );
+
 
 CREATE TABLE IF NOT EXISTS trade_items (
   id SERIAL PRIMARY KEY,

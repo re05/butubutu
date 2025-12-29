@@ -49,6 +49,42 @@ function internalRequired(req, res, next) {
   return next();
 }
 
+// body: { ids: [1,2,3] }
+// return: { listings: [{id, fruit_item_id, seller_id, status, quantity}], missing: [..] }
+app.post('/internal/listings/summary', internalRequired, async (req, res) => {
+  try {
+    const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set(raw.map(Number).filter((x) => Number.isInteger(x) && x > 0))];
+    if (ids.length === 0) return res.status(400).json({ error: 'ids_required' });
+    if (ids.length > 200) return res.status(400).json({ error: 'too_many_ids' });
+
+    const r = await pool.query(
+      `SELECT id, fruit_item_id, seller_id, status, quantity
+         FROM listings
+        WHERE id = ANY($1::int[])`,
+      [ids]
+    );
+
+    const got = new Set(r.rows.map((x) => Number(x.id)));
+    const missing = ids.filter((id) => !got.has(id));
+
+    return res.json({
+      listings: r.rows.map((x) => ({
+        id: Number(x.id),
+        fruit_item_id: Number(x.fruit_item_id),
+        seller_id: Number(x.seller_id),
+        status: String(x.status),
+        quantity: Number(x.quantity),
+      })),
+      missing
+    });
+  } catch (e) {
+    console.error('internal summary error', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.get('/catalog/items', async (_req, res) => {
@@ -387,6 +423,42 @@ app.post('/internal/listings/summary', internalRequired, async (req, res) => {
   } catch (e) {
     console.error('internal summary error', e);
     return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// 取引側が「片側1種類チェック」や集計に使う：listing の果物IDと在庫などを返す
+// body: { ids: [1,2,3] }
+app.post('/internal/listings/summary', internalRequired, async (req, res) => {
+  try {
+    const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set(raw.map(Number).filter((x) => Number.isInteger(x) && x > 0))];
+
+    if (ids.length === 0) return res.status(400).json({ error: 'ids_required' });
+    if (ids.length > 200) return res.status(400).json({ error: 'too_many_ids' });
+
+    const r = await pool.query(
+      `SELECT id, fruit_item_id, seller_id, status, quantity
+         FROM listings
+        WHERE id = ANY($1::int[])`,
+      [ids]
+    );
+
+    const got = new Set(r.rows.map((x) => Number(x.id)));
+    const missing = ids.filter((id) => !got.has(id));
+
+    return res.json({
+      listings: r.rows.map((x) => ({
+        id: Number(x.id),
+        fruit_item_id: Number(x.fruit_item_id),
+        seller_id: Number(x.seller_id),
+        status: String(x.status),
+        quantity: Number(x.quantity),
+      })),
+      missing
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 

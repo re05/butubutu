@@ -9,10 +9,11 @@
       - auth_db_data:/var/lib/postgresql/data
       - ./db/auth/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d authdb"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 20
+
 
   listing-db:
     image: postgres:15-alpine
@@ -24,7 +25,7 @@
       - listing_db_data:/var/lib/postgresql/data
       - ./db/listing/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d listingdb"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -39,7 +40,23 @@
       - trade_db_data:/var/lib/postgresql/data
       - ./db/trade/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d tradedb"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+
+  fx-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypass
+      POSTGRES_DB: fxdb
+    volumes:
+      - fx_db_data:/var/lib/postgresql/data
+      - ./db/fx/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -90,6 +107,7 @@
       NODE_ENV: production
       INTERNAL_TOKEN: internal-secret
       LISTING_SVC_URL: http://listing-svc:4010
+      FX_SVC_URL: http://fx-svc:4030
     depends_on:
       trade-db:
         condition: service_healthy
@@ -108,6 +126,7 @@
       VITE_AUTH_URL: "http://localhost:4100"
       VITE_LISTING_URL: "http://localhost:4110"
       VITE_TRADE_URL: "http://localhost:4120"
+      VITE_FX_URL: "http://localhost:4130"
     depends_on:
       auth-svc:
         condition: service_started
@@ -119,7 +138,29 @@
       - "3100:3000"
 
 
+
+  fx-svc:
+    build: ./services/fx-svc
+    environment:
+      DB_HOST: fx-db
+      DB_USER: myuser
+      DB_PASSWORD: mypass
+      DB_NAME: fxdb
+      INTERNAL_TOKEN: internal-secret
+      NODE_ENV: production
+      CORS_ORIGIN: "http://localhost:3100"
+      PORT: 4030
+    depends_on:
+      fx-db:
+        condition: service_healthy
+    ports:
+      - "4130:4030"
+
+
+
 volumes:
   auth_db_data:
   listing_db_data:
   trade_db_data:
+  fx_db_data:
+

@@ -148,11 +148,13 @@ export default function TradeDetail() {
     (youAreProposer || youAreReceiver) &&
     !shippedMine;
 
+  const otherShipped = youAreProposer ? !!trade?.shipped_receiver_at : !!trade?.shipped_proposer_at;
+
   const canReceived =
     !!trade &&
-    status === "Shipping" &&
-    bothShipped &&
+    (status === "Accepted" || status === "Shipping") &&
     (youAreProposer || youAreReceiver) &&
+    otherShipped &&
     !receivedMine;
 
 
