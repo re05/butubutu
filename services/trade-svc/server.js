@@ -169,11 +169,20 @@ async function buildFxPayloadFromTrade(tradeId) {
 async function validateTradeItemOwnership({ give_items, take_items, proposer_id, receiver_id }) {
   const ids = [...new Set([...give_items, ...take_items].map((x) => Number(x.listing_id)))];
 
-  const r = await fetchListingSummaryViaListingSvc(ids);
-  if (!r.ok) return r;
+  let sum;
+  try {
+    // listing-svc の /internal/listings/summary は { listings, missing } を返す
+    sum = await fetchListingSummaryViaListingSvc(ids);
+  } catch (e) {
+    return {
+      ok: false,
+      status: 502,
+      error: { error: 'listing_summary_failed', detail: String(e?.message || e) }
+    };
+  }
 
-  const listings = r.data.listings || [];
-  const missing = r.data.missing || [];
+  const listings = Array.isArray(sum?.listings) ? sum.listings : [];
+  const missing = Array.isArray(sum?.missing) ? sum.missing : [];
 
   if (missing.length) {
     return { ok: false, status: 404, error: { error: 'listing_not_found', missing } };
@@ -181,65 +190,43 @@ async function validateTradeItemOwnership({ give_items, take_items, proposer_id,
 
   const map = new Map(listings.map((x) => [Number(x.id), x]));
 
-  // give は proposer の出品、take は receiver の出品であることを強制
+  // give は proposer の出品
   for (const it of give_items) {
     const id = Number(it.listing_id);
     const row = map.get(id);
     if (!row) return { ok: false, status: 404, error: { error: 'listing_not_found', listing_id: id } };
 
     if (Number(row.seller_id) !== Number(proposer_id)) {
-      return {
-        ok: false,
-        status: 403,
-        error: { error: 'give_not_owned', listing_id: id, owner_id: Number(row.seller_id) }
-      };
+      return { ok: false, status: 403, error: { error: 'give_not_owned', listing_id: id, owner_id: Number(row.seller_id) } };
     }
     if (String(row.status) !== 'Active') {
-      return {
-        ok: false,
-        status: 409,
-        error: { error: 'give_not_active', listing_id: id, status: String(row.status) }
-      };
+      return { ok: false, status: 409, error: { error: 'give_not_active', listing_id: id, status: String(row.status) } };
     }
     if (Number(row.quantity) < Number(it.quantity)) {
-      return {
-        ok: false,
-        status: 409,
-        error: { error: 'give_insufficient_stock', listing_id: id, have: Number(row.quantity), want: Number(it.quantity) }
-      };
+      return { ok: false, status: 409, error: { error: 'give_insufficient_stock', listing_id: id, have: Number(row.quantity), want: Number(it.quantity) } };
     }
   }
 
+  // take は receiver の出品
   for (const it of take_items) {
     const id = Number(it.listing_id);
     const row = map.get(id);
     if (!row) return { ok: false, status: 404, error: { error: 'listing_not_found', listing_id: id } };
 
     if (Number(row.seller_id) !== Number(receiver_id)) {
-      return {
-        ok: false,
-        status: 403,
-        error: { error: 'take_not_owned', listing_id: id, owner_id: Number(row.seller_id) }
-      };
+      return { ok: false, status: 403, error: { error: 'take_not_owned', listing_id: id, owner_id: Number(row.seller_id) } };
     }
     if (String(row.status) !== 'Active') {
-      return {
-        ok: false,
-        status: 409,
-        error: { error: 'take_not_active', listing_id: id, status: String(row.status) }
-      };
+      return { ok: false, status: 409, error: { error: 'take_not_active', listing_id: id, status: String(row.status) } };
     }
     if (Number(row.quantity) < Number(it.quantity)) {
-      return {
-        ok: false,
-        status: 409,
-        error: { error: 'take_insufficient_stock', listing_id: id, have: Number(row.quantity), want: Number(it.quantity) }
-      };
+      return { ok: false, status: 409, error: { error: 'take_insufficient_stock', listing_id: id, have: Number(row.quantity), want: Number(it.quantity) } };
     }
   }
 
   return { ok: true, status: 200 };
 }
+
 
 function internalRequired(req, res, next) {
   const token = (req.header('X-Internal-Token') || '').toString();
