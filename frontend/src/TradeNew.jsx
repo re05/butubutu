@@ -22,6 +22,70 @@ function isInStock(l) {
   return true;
 }
 
+/**
+ * 相場（固定表）
+ * fruit_item_id -> 価値（数値が大きいほど高い）
+ * 必要に応じて追加/調整してください
+ */
+const FRUIT_VALUE = {
+  1: 100, // リンゴ
+  2: 80,  // バナナ
+  3: 90,  // オレンジ
+  // 例:
+  // 4: 120, // ブドウ
+  // 5: 200, // イチゴ
+};
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function fmtQty(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "-";
+  // 1.00 -> 1 / 1.25 -> 1.25
+  const v = Math.round(x * 100) / 100;
+  return Number.isInteger(v) ? String(v) : String(v);
+}
+
+function FruitLabel({ name, img }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+      {img ? (
+        <img
+          src={img}
+          alt=""
+          style={{ width: 22, height: 18, objectFit: "cover", borderRadius: 4 }}
+        />
+      ) : null}
+      <span>{name}</span>
+    </span>
+  );
+}
+
+
+/**
+ * 相手(take)の数量に対して、自分(give)が出す「目安数量」を返す
+ * fair = (take価値 * takeQty) / give価値
+ */
+function calcFairGiveQty(giveFruitItemId, takeFruitItemId, takeQty) {
+  const gv = FRUIT_VALUE[Number(giveFruitItemId)];
+  const tv = FRUIT_VALUE[Number(takeFruitItemId)];
+  const tq = Number(takeQty);
+  if (!gv || !tv) return null;
+  if (!Number.isFinite(tq) || tq <= 0) return null;
+  return (tv * tq) / gv;
+}
+
+function judgeOffer(giveQty, fairGiveQty) {
+  const g = Number(giveQty);
+  const f = Number(fairGiveQty);
+  if (!Number.isFinite(g) || !Number.isFinite(f) || f <= 0) return "";
+  const diff = (g - f) / f;
+  if (Math.abs(diff) <= 0.1) return "だいたい相場";
+  return diff > 0 ? "相場より多め（相手に有利）" : "相場より少なめ（相手に不利）";
+}
+
 export default function TradeNew() {
   const nav = useNavigate();
   const q = useQuery();
@@ -48,7 +112,6 @@ export default function TradeNew() {
     setErr("");
     setOk("");
 
-    // 自分の出品（在庫0は後でUIから除外）
     fetch(`${LISTING_URL}/listings/mine`, { headers: { ...authHeader() } })
       .then(async (r) => {
         if (r.status === 401) throw new Error("ログインが必要です（自分の出品を取得できません）");
@@ -58,7 +121,6 @@ export default function TradeNew() {
       .then((xs) => setMine(Array.isArray(xs) ? xs : []))
       .catch((e) => setErr(String(e?.message || e)));
 
-    // 提案先がクエリで指定されている場合はそれを取得して固定
     if (takeListingIdFromQuery > 0) {
       fetch(`${LISTING_URL}/listings/${takeListingIdFromQuery}`, { headers: { ...authHeader() } })
         .then(async (r) => {
@@ -73,7 +135,6 @@ export default function TradeNew() {
       return;
     }
 
-    // クエリ指定が無い場合：全出品から「自分以外 + 在庫あり」だけ候補にする
     fetch(`${LISTING_URL}/listings`, { headers: { ...authHeader() } })
       .then(async (r) => {
         if (!r.ok) throw new Error("提案先の候補一覧を取得できません");
@@ -83,7 +144,6 @@ export default function TradeNew() {
       .catch((e) => setErr(String(e?.message || e)));
   }, [takeListingIdFromQuery]);
 
-  // クエリ指定無しの時だけ、選択された提案先の詳細を追従
   React.useEffect(() => {
     if (takeListingIdFromQuery > 0) return;
     if (!(takeListingId > 0)) {
@@ -110,6 +170,40 @@ export default function TradeNew() {
       .filter(isInStock)
       .filter((x) => (mySellerId ? Number(x.seller_id) !== Number(mySellerId) : true));
   }, [others, mySellerId]);
+
+  // ここから相場表示（mineInStock が定義された後に置く）
+  const giveSelected = React.useMemo(() => {
+    return mineInStock.find((x) => Number(x.id) === Number(giveListingId)) || null;
+  }, [mineInStock, giveListingId]);
+
+  const marketInfo = React.useMemo(() => {
+    if (!target || !giveSelected) return null;
+
+    const fair = calcFairGiveQty(
+      giveSelected.fruit_item_id,
+      target.fruit_item_id,
+      takeQty
+    );
+    if (fair == null) return { missing: true };
+
+    const per1 = calcFairGiveQty(
+      giveSelected.fruit_item_id,
+      target.fruit_item_id,
+      1
+    );
+
+    return {
+      missing: false,
+      giveName: giveSelected.fruit_name || giveSelected.title || "自分の果物",
+      takeName: target.fruit_name || target.title || "相手の果物",
+      giveImg: giveSelected.image_url || "",
+      takeImg: target.image_url || "",
+      per1: per1 == null ? null : round2(per1),
+      fairGive: round2(fair),
+      judge: judgeOffer(giveQty, fair),
+    };
+  }, [target, giveSelected, takeQty, giveQty]);
+
 
   async function submit() {
     setErr("");
@@ -178,7 +272,6 @@ export default function TradeNew() {
 
       <h2>交換提案を作成</h2>
 
-      {/* 提案先 */}
       <div style={{ marginTop: 14 }}>
         <div style={{ fontWeight: 700 }}>提案先</div>
 
@@ -201,7 +294,6 @@ export default function TradeNew() {
           </select>
         )}
 
-        {/* ここに「もらう数量」を置く */}
         <div style={{ marginTop: 12 }}>
           <div style={{ fontWeight: 700 }}>もらう数量</div>
           <input
@@ -214,7 +306,6 @@ export default function TradeNew() {
         </div>
       </div>
 
-      {/* 自分が出す */}
       <div style={{ marginTop: 18 }}>
         <div style={{ fontWeight: 700 }}>自分が出すもの（在庫ありのみ）</div>
 
@@ -241,6 +332,81 @@ export default function TradeNew() {
             onChange={(e) => setGiveQty(Number(e.target.value))}
           />
         </div>
+
+{target && giveSelected ? (
+  <div style={{ marginTop: 12, border: "1px solid #ddd", borderRadius: 10, padding: 12 }}>
+    <div style={{ fontWeight: 700 }}>相場（目安）</div>
+
+    {marketInfo?.missing ? (
+      <div style={{ marginTop: 8 }}>
+        この組み合わせの相場データが未登録です（FRUIT_VALUE を追加してください）
+      </div>
+    ) : marketInfo ? (
+      <>
+        {/* 相場：表だけ（数量=1 の列は出さない） */}
+        <table
+          border="1"
+          cellPadding="8"
+          style={{ borderCollapse: "collapse", width: "100%", marginTop: 10 }}
+        >
+          <thead>
+            <tr>
+              <th style={{ width: "45%" }}>相手（1個）</th>
+              <th style={{ width: "55%" }}>同じ価値の目安</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>
+                <FruitLabel name={marketInfo.takeName} img={marketInfo.takeImg} />
+              </td>
+              <td style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                <FruitLabel name={marketInfo.giveName} img={marketInfo.giveImg} />
+                <span style={{ fontWeight: 800, fontSize: 16 }}>
+                  {fmtQty(marketInfo.per1)}
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        {/* あなたの提案：果物と数量を分ける（くっつけない、+も出さない） */}
+        <div style={{ marginTop: 12, fontWeight: 700 }}>あなたの提案（入力に連動）</div>
+
+        <table
+          border="1"
+          cellPadding="8"
+          style={{ borderCollapse: "collapse", width: "100%", marginTop: 8 }}
+        >
+          <thead>
+            <tr>
+              <th>あなたが出す</th>
+              <th style={{ width: 120 }}>数量</th>
+              <th>あなたがもらう</th>
+              <th style={{ width: 120 }}>数量</th>
+              <th style={{ width: 260 }}>判定</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><FruitLabel name={marketInfo.giveName} img={marketInfo.giveImg} /></td>
+              <td style={{ textAlign: "right", fontWeight: 800 }}>{fmtQty(giveQty)}</td>
+              <td><FruitLabel name={marketInfo.takeName} img={marketInfo.takeImg} /></td>
+              <td style={{ textAlign: "right", fontWeight: 800 }}>{fmtQty(takeQty)}</td>
+              <td style={{ fontWeight: 800 }}>{marketInfo.judge}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.75 }}>
+          目安の出す数量（もらう数量 {fmtQty(takeQty)} に対して）: {fmtQty(marketInfo.fairGive)}
+        </div>
+      </>
+    ) : null}
+  </div>
+) : null}
+
+
       </div>
 
       <div style={{ marginTop: 18 }}>
