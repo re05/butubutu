@@ -93,6 +93,82 @@ function authRequired(req, res, next) {
   }
 }
 
+function internalRequired(req,res,next){
+  const key = req.headers['x-internal-key'];
+  if(!process.env.INTERNAL_API_KEY || key !== process.env.INTERNAL_API_KEY){
+    return res.status(401).json({error:'unauthorized'});
+  }
+  next();
+}
+
+// 購入確定：Active を Sold にして、購入に必要な情報だけ返す
+app.post('/internal/listings/:id/checkout', internalRequired, authRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+
+  const client = await pool.connect();
+  try{
+    await client.query('BEGIN');
+
+    const q = await client.query(
+      `SELECT id,title,price,status,seller_id,image_url
+         FROM listings
+        WHERE id=$1
+        FOR UPDATE`,
+      [id]
+    );
+    if(q.rowCount === 0){
+      await client.query('ROLLBACK');
+      return res.status(404).json({error:'not_found'});
+    }
+    const l = q.rows[0];
+
+    if(l.status !== 'Active'){
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'not_active'});
+    }
+    if(Number(l.seller_id) === Number(req.user.id)){
+      await client.query('ROLLBACK');
+      return res.status(403).json({error:'own_listing'});
+    }
+
+    await client.query(`UPDATE listings SET status='Sold' WHERE id=$1`, [id]);
+    await client.query('COMMIT');
+
+    return res.json({
+      id: l.id,
+      title: l.title,
+      price: l.price,
+      seller_id: l.seller_id,
+      image_url: l.image_url
+    });
+  }catch(e){
+    await client.query('ROLLBACK');
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }finally{
+    client.release();
+  }
+});
+
+// 失敗時の戻し（order-svc からだけ呼ぶ）
+app.post('/internal/listings/:id/revert', internalRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+  try{
+    await pool.query(
+      `UPDATE listings SET status='Active'
+        WHERE id=$1 AND status='Sold'`,
+      [id]
+    );
+    return res.json({ok:true});
+  }catch(e){
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }
+});
+
+
 app.get('/health', (req, res) =>
   res.json({ ok: true, service: 'listing-svc' })
 );
@@ -187,28 +263,19 @@ app.get('/listings/:id/comments', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `
-      SELECT
-        c.id,
-        c.body,
-        c.created_at,
-        c.author_id,
-        u.email AS author_email
-      FROM listing_comments c
-      LEFT JOIN users u
-        ON c.author_id = u.id
-      WHERE c.listing_id = $1
-      ORDER BY c.created_at ASC
-      `,
+      `SELECT id, body, created_at, author_id, author_email
+         FROM listing_comments
+        WHERE listing_id = $1
+        ORDER BY created_at ASC`,
       [listingId]
     );
-
     res.json(result.rows);
   } catch (err) {
     console.error('GET /listings/:id/comments error', err);
     res.status(500).json({ error: 'failed to fetch comments' });
   }
 });
+
 
 // 商品にコメントを追加（ログイン必須）
 app.post('/listings/:id/comments', authRequired, async (req, res) => {
@@ -233,11 +300,12 @@ app.post('/listings/:id/comments', authRequired, async (req, res) => {
     }
 
     const r = await pool.query(
-      `INSERT INTO listing_comments(listing_id,author_id,body)
-       VALUES ($1,$2,$3)
-       RETURNING id,body,created_at,author_id`,
-      [listingId, req.user.id, body]
+      `INSERT INTO listing_comments(listing_id,author_id,author_email,body)
+      VALUES ($1,$2,$3,$4)
+      RETURNING id,body,created_at,author_id,author_email`,
+      [listingId, req.user.id, req.user.email, body]
     );
+    return res.status(201).json(r.rows[0]);
     const c = r.rows[0];
 
     const ur = await pool.query(

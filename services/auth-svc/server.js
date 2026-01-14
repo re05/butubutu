@@ -148,6 +148,22 @@ app.get('/me', authRequired, async (req,res)=>{
   }
 });
 
+app.get('/me/address', authRequired, async (req,res)=>{
+  try{
+    const q = await pool.query(
+      `SELECT id,email,role,full_name,postal_code,prefecture,city,address_line,phone
+         FROM users
+        WHERE email=$1`,
+      [req.user.sub]
+    );
+    if(q.rowCount===0) return res.status(404).json({error:'not_found'});
+    return res.json(q.rows[0]);
+  }catch(e){
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }
+});
+
 // ここから運営用API
 
 // 全ユーザー一覧（運営画面用）

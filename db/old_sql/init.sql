@@ -1,0 +1,36 @@
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  listing_id INTEGER NOT NULL,
+  seller_id INTEGER NOT NULL,
+  buyer_id INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  price INTEGER NOT NULL,
+  image_url TEXT,
+  status TEXT NOT NULL DEFAULT 'CREATED',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  shipped_at TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+  confirmed_at TIMESTAMPTZ,
+  shipping_code TEXT UNIQUE,
+  yamato_tracking_no TEXT,
+  yamato_status TEXT
+);
+
+CREATE TABLE IF NOT EXISTS order_messages (
+  id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id INTEGER NOT NULL,
+  sender_id INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS shipping_labels (
+  id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  order_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  postal_code TEXT NOT NULL,
+  address1 TEXT NOT NULL,
+  address2 TEXT,
+  phone TEXT NOT NULL
+);

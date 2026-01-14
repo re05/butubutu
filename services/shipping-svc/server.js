@@ -16,103 +16,90 @@ const pool = new pg.Pool({
   database: process.env.DB_NAME,
 });
 
-// ---- 健康チェック ----
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: "shipping-svc" });
 });
 
-// ---- ラベル表示ページ ----
+// 発送ラベル（印刷想定）
 app.get('/labels/:code', async (req, res) => {
-  const code = req.params.code;
-  if (!code) {
-    return res.status(400).send('code is required');
-  }
+  const code = String(req.params.code || '');
+  if(!code) return res.status(400).send('code is required');
 
-  try {
+  try{
     const q = await pool.query(
-      `SELECT 
-         code, 
-         order_id, 
-         name, 
-         postal_code, 
-         address1, 
-         address2, 
-         phone
-       FROM shipping_labels
-       WHERE code = $1`,
+      `SELECT
+        s.code, s.order_id, s.name, s.postal_code, s.address1, s.address2, s.phone,
+        o.listing_title AS title,
+        o.listing_price AS price
+      FROM shipping_labels s
+      JOIN orders o ON o.id = s.order_id
+      WHERE s.code=$1`,
       [code]
     );
 
-    if (q.rowCount === 0) {
-      return res.status(404).send('not found');
-    }
+    if(q.rowCount===0) return res.status(404).send('not found');
 
-    const l = q.rows[0];
+    const r = q.rows[0];
 
-    // ---- HTML 返却（印刷しやすい簡易画面） ----
-res.send(`<!doctype html>
+    res.send(`<!doctype html>
 <html lang="ja">
-<head> ... </head>
+<head>
+  <meta charset="utf-8" />
+  <title>発送ラベル</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI"; padding: 16px; }
+    .box { border:1px solid #333; padding:16px; width: 420px; }
+    .muted { color:#666; font-size:12px; }
+    .big { font-size:18px; font-weight:700; }
+  </style>
+</head>
 <body>
-  <h1>ヤマト用 発送一覧</h1>
-  <table> ... </table>
-  <tbody>
-    ${rows.map(r => `
-      <tr>
-        ...
-        <td class="actions">
-          <form method="POST" action="/yamato/orders/${r.order_id}/status">
-            <input type="hidden" name="yamato_status" value="PREPARED" />
-            <button type="submit">準備中</button>
-          </form>
-          <form method="POST" action="/yamato/orders/${r.order_id}/status">
-            <input type="hidden" name="yamato_status" value="SHIPPED" />
-            <button type="submit">発送済み</button>
-          </form>
-          <form method="POST" action="/yamato/orders/${r.order_id}/status">
-            <input type="hidden" name="yamato_status" value="IN_TRANSIT" />
-            <button type="submit">配送中</button>
-          </form>
-          <form method="POST" action="/yamato/orders/${r.order_id}/status">
-            <input type="hidden" name="yamato_status" value="DELIVERED" />
-            <button type="submit">配達完了</button>
-          </form>
-        </td>
-      </tr>
-    `).join('')}
-  </tbody>
+  <div class="box">
+    <div class="muted">発送コード</div>
+    <div class="big">${r.code}</div>
+    <hr/>
+    <div class="muted">宛名</div>
+    <div class="big">${r.name}</div>
+    <div class="muted">住所</div>
+    <div>${r.postal_code}</div>
+    <div>${r.address1} ${r.address2 || ''}</div>
+    <div class="muted">電話</div>
+    <div>${r.phone}</div>
+    <hr/>
+    <div class="muted">商品</div>
+    <div>${r.title}（¥${r.price}）</div>
+  </div>
 </body>
 </html>`);
-
-  } catch (e) {
+  }catch(e){
     console.error(e);
     return res.status(500).send('server error');
   }
 });
 
-// ヤマト用：注文一覧（新しい順）
+// ヤマト用：注文一覧（COMPLETED以外）
 app.get('/yamato/orders', async (req, res) => {
   try {
     const q = await pool.query(
       `SELECT
-         o.id as order_id,
-         o.status,
-         o.yamato_status,
-         o.created_at,
-         l.title,
-         l.price,
-         s.code,
-         s.name,
-         s.postal_code,
-         s.address1,
-         s.address2,
-         s.phone
-       FROM orders o
-       JOIN shipping_labels s ON s.order_id = o.id
-       JOIN listings l ON l.id = o.listing_id
-        WHERE o.status <> 'COMPLETED' 
-       ORDER BY o.id DESC`
+        o.id as order_id,
+        o.status,
+        o.yamato_status,
+        o.created_at,
+        o.listing_title AS title,
+        o.listing_price AS price,
+        s.code,
+        s.name,
+        s.postal_code,
+        s.address1,
+        s.address2,
+        s.phone
+      FROM orders o
+      JOIN shipping_labels s ON s.order_id = o.id
+      WHERE o.status <> 'COMPLETED'
+      ORDER BY o.id DESC`
     );
+
 
     const rows = q.rows;
 
@@ -150,7 +137,7 @@ app.get('/yamato/orders', async (req, res) => {
       ${rows.map(r => `
         <tr>
           <td>${r.order_id}</td>
-          <td>${r.code}</td>
+          <td><a href="/labels/${r.code}" target="_blank" rel="noopener">${r.code}</a></td>
           <td>${r.title}</td>
           <td>¥${r.price}</td>
           <td>${r.name}</td>
@@ -187,10 +174,9 @@ app.get('/yamato/orders', async (req, res) => {
   }
 });
 
-// ヤマト用：ステータス更新 → orders.yamato_status を更新
 app.post('/yamato/orders/:id/status', async (req, res) => {
   const id = Number(req.params.id);
-  const { yamato_status } = req.body || {};
+  const yamato_status = String(req.body?.yamato_status || '');
 
   if (!Number.isInteger(id) || !yamato_status) {
     return res.status(400).send('bad request');
@@ -198,9 +184,7 @@ app.post('/yamato/orders/:id/status', async (req, res) => {
 
   try {
     await pool.query(
-      `UPDATE orders
-         SET yamato_status = $1
-       WHERE id = $2`,
+      `UPDATE orders SET yamato_status=$1 WHERE id=$2`,
       [yamato_status, id]
     );
     return res.redirect('/yamato/orders');
@@ -210,9 +194,5 @@ app.post('/yamato/orders/:id/status', async (req, res) => {
   }
 });
 
-
-
 const PORT = process.env.PORT || 4030;
 app.listen(PORT, () => console.log(`shipping-svc listening on ${PORT}`));
-
-app.use(express.urlencoded({ extended: false }));
