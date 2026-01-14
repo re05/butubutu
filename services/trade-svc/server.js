@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
@@ -123,6 +123,48 @@ async function postFxTrade(payload) {
     throw new Error(`fx_post_failed status=${resp.status} body=${resp.text}`);
   }
   return resp.json;
+}
+
+
+async function ensureShippingLabelsForTrade(tradeId, proposerId, receiverId) {
+  const base = process.env.SHIPPING_SVC_URL || 'http://shipping-svc:4040';
+  const token = process.env.INTERNAL_TOKEN || '';
+  if (!token) throw new Error('missing_internal_token');
+
+  // trade_items から簡易サマリを作る（ラベルに載せるため）
+  const r = await pool.query(
+    `SELECT side, listing_id, quantity
+       FROM trade_items
+      WHERE trade_id=$1
+      ORDER BY side ASC, listing_id ASC`,
+    [tradeId]
+  );
+  const rows = r.rows || [];
+  const give = rows.filter((x) => x.side === 'give');
+  const take = rows.filter((x) => x.side === 'take');
+
+  const fmt = (arr) => arr.map((x) => `listing#${Number(x.listing_id)} x${Number(x.quantity)}`).join(', ');
+  const giveSummary = fmt(give);
+  const takeSummary = fmt(take);
+
+  const a = await postJson(
+    `${base}/internal/labels`,
+    { 'X-Internal-Token': token },
+    { trade_id: tradeId, direction: 'A_to_B', from_user_id: proposerId, to_user_id: receiverId, item_summary: giveSummary }
+  );
+  const b = await postJson(
+    `${base}/internal/labels`,
+    { 'X-Internal-Token': token },
+    { trade_id: tradeId, direction: 'B_to_A', from_user_id: receiverId, to_user_id: proposerId, item_summary: takeSummary }
+  );
+
+  const okA = a.status >= 200 && a.status < 300;
+  const okB = b.status >= 200 && b.status < 300;
+
+  return {
+    a_to_b: okA ? a.json?.label_code : null,
+    b_to_a: okB ? b.json?.label_code : null
+  };
 }
 
 async function buildFxPayloadFromTrade(tradeId) {
@@ -519,7 +561,16 @@ app.patch('/trades/:id/accept', authRequired, async (req,res)=>{
     );
 
     await client.query('COMMIT');
-    return res.json(u.rows[0]);
+
+    // shipping-svc にラベル作成（失敗しても取引は成立済みにする。後で再実行できるよう shipping-svc 側は冪等）
+    let shipping_labels = null;
+    try {
+      shipping_labels = await ensureShippingLabelsForTrade(id, u.rows[0].proposer_id, u.rows[0].receiver_id);
+    } catch (e) {
+      console.error('ensureShippingLabelsForTrade failed', e);
+    }
+
+    return res.json({ ...u.rows[0], shipping_labels });
 
   }catch(e){
     await client.query('ROLLBACK');

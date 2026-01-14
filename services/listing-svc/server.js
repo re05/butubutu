@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
@@ -209,21 +209,6 @@ app.get('/listings/mine', authRequired, async (req, res) => {
   }
 });
 
-app.get('/listings/mine', authRequired, async (req, res) => {
-  try {
-    const q = await pool.query(
-      `SELECT id, fruit_item_id, quantity, status, seller_id, image_url, description
-         FROM listings
-        WHERE seller_id = $1
-        ORDER BY id DESC`,
-      [req.user.id]
-    );
-    return res.json(q.rows);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
-  }
-});
 
 
 
@@ -383,82 +368,6 @@ app.put('/listings/:id', authRequired, async (req, res) => {
     return res.status(500).json({ error: 'server_error' });
   } finally {
     client.release();
-  }
-});
-
-// 取引側が「持ち主チェック」などに使う：listing の要点をまとめて返す
-// body: { ids: [1,2,3] }
-// return: { listings: [{id, seller_id, status, quantity}], missing: [..] }
-app.post('/internal/listings/summary', internalRequired, async (req, res) => {
-  try {
-    const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-    const ids = [...new Set(raw.map(Number).filter((x) => Number.isInteger(x) && x > 0))];
-
-    if (ids.length === 0) {
-      return res.status(400).json({ error: 'ids_required' });
-    }
-    if (ids.length > 100) {
-      return res.status(400).json({ error: 'too_many_ids' });
-    }
-
-    const r = await pool.query(
-      `SELECT id, seller_id, status, quantity
-         FROM listings
-        WHERE id = ANY($1::int[])`,
-      [ids]
-    );
-
-    const got = new Set(r.rows.map((x) => Number(x.id)));
-    const missing = ids.filter((id) => !got.has(id));
-
-    return res.json({
-      listings: r.rows.map((x) => ({
-        id: Number(x.id),
-        seller_id: Number(x.seller_id),
-        status: String(x.status),
-        quantity: Number(x.quantity)
-      })),
-      missing
-    });
-  } catch (e) {
-    console.error('internal summary error', e);
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-// 取引側が「片側1種類チェック」や集計に使う：listing の果物IDと在庫などを返す
-// body: { ids: [1,2,3] }
-app.post('/internal/listings/summary', internalRequired, async (req, res) => {
-  try {
-    const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-    const ids = [...new Set(raw.map(Number).filter((x) => Number.isInteger(x) && x > 0))];
-
-    if (ids.length === 0) return res.status(400).json({ error: 'ids_required' });
-    if (ids.length > 200) return res.status(400).json({ error: 'too_many_ids' });
-
-    const r = await pool.query(
-      `SELECT id, fruit_item_id, seller_id, status, quantity
-         FROM listings
-        WHERE id = ANY($1::int[])`,
-      [ids]
-    );
-
-    const got = new Set(r.rows.map((x) => Number(x.id)));
-    const missing = ids.filter((id) => !got.has(id));
-
-    return res.json({
-      listings: r.rows.map((x) => ({
-        id: Number(x.id),
-        fruit_item_id: Number(x.fruit_item_id),
-        seller_id: Number(x.seller_id),
-        status: String(x.status),
-        quantity: Number(x.quantity),
-      })),
-      missing
-    });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: 'server_error' });
   }
 });
 

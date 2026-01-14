@@ -1,4 +1,4 @@
-﻿services:
+services:
   auth-db:
     image: postgres:15-alpine
     environment:
@@ -123,6 +123,7 @@
       INTERNAL_TOKEN: internal-secret
       LISTING_SVC_URL: http://listing-svc:4010
       FX_SVC_URL: http://fx-svc:4030
+      SHIPPING_SVC_URL: http://shipping-svc:4040
     depends_on:
       trade-db:
         condition: service_healthy
