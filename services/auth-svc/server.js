@@ -26,6 +26,9 @@ const pool = new pg.Pool({
   database: process.env.DB_NAME
 });
 
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || 'internal-secret';
+
+
 function authRequired(req,res,next){
   const h = req.headers['authorization'] || '';
   const [scheme, token] = h.split(' ');
@@ -44,7 +47,31 @@ function adminRequired(req,res,next){
   next();
 }
 
+function internalRequired(req,res,next){
+  const token = req.headers['x-internal-token'];
+  if(!token || token !== INTERNAL_TOKEN) return res.status(401).json({error:'unauthorized_internal'});
+  next();
+}
+
 app.get('/health', (req,res)=>res.json({ok:true}));
+
+// 内部用：住所取得（shipping-svc などが利用）
+app.get('/internal/users/:id/address', internalRequired, async (req,res)=>{
+  const id = Number(req.params.id);
+  if(!Number.isInteger(id)) return res.status(400).json({error:'bad_id'});
+  try{
+    const q = await pool.query(
+      'SELECT id, full_name, postal_code, prefecture, city, address_line, phone FROM users WHERE id=$1',
+      [id]
+    );
+    if(q.rowCount===0) return res.status(404).json({error:'not_found'});
+    return res.json(q.rows[0]);
+  }catch(e){
+    console.error(e);
+    return res.status(500).json({error:'server_error'});
+  }
+});
+
 
 // ログイン
 app.post('/login', async (req,res)=>{
@@ -174,13 +201,6 @@ app.get('/users/:id', async (req, res) => {
     console.error(e);
     return res.status(500).json({ error: 'server_error' });
   }
-});
-
-app.get("/users/:id", async (req,res) => {
-  const id = Number(req.params.id);
-  const q = await pool.query("SELECT id, email FROM users WHERE id=$1", [id]);
-  if(q.rowCount === 0) return res.status(404).json({error:"not_found"});
-  res.json(q.rows[0]);
 });
 
 

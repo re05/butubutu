@@ -61,6 +61,20 @@
       timeout: 3s
       retries: 20
 
+  shipping-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: shippinguser
+      POSTGRES_PASSWORD: shippingpass
+      POSTGRES_DB: shippingdb
+    volumes:
+      - shipping_db_data:/var/lib/postgresql/data
+      - ./db/shipping/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 
   auth-svc:
@@ -72,6 +86,7 @@
       DB_NAME: authdb
       JWT_SECRET: mysecret
       NODE_ENV: production
+      INTERNAL_TOKEN: internal-secret
     depends_on:
       auth-db:
         condition: service_healthy
@@ -118,6 +133,23 @@
     ports:
       - "4120:4020"
 
+  shipping-svc:
+    build: ./services/shipping-svc
+    environment:
+      DB_HOST: shipping-db
+      DB_USER: shippinguser
+      DB_PASSWORD: shippingpass
+      DB_NAME: shippingdb
+      PORT: 4040
+      INTERNAL_TOKEN: internal-secret
+      AUTH_SVC_URL: http://auth-svc:4000
+    depends_on:
+      shipping-db:
+        condition: service_healthy
+      auth-svc:
+        condition: service_started
+    ports:
+      - "4140:4040"
 
 
   frontend:
@@ -163,4 +195,5 @@ volumes:
   listing_db_data:
   trade_db_data:
   fx_db_data:
+  shipping_db_data:
 
