@@ -4,6 +4,7 @@ import { tradeApi } from "./tradeApi";
 
 const AUTH_URL = import.meta.env.VITE_AUTH_URL || "http://localhost:4100";
 const LISTING_URL = import.meta.env.VITE_LISTING_URL || "http://localhost:4110";
+const SHIPPING_URL = import.meta.env.VITE_SHIPPING_URL || "http://localhost:4140";
 
 function statusJa(s) {
   const v = String(s || "");
@@ -12,6 +13,19 @@ function statusJa(s) {
   if (v === "Shipping") return "発送中";
   if (v === "Completed") return "完了";
   if (v === "Rejected") return "却下";
+  return v || "-";
+}
+
+
+function yamatoStatusJa(s) {
+  const v = String(s || "").toUpperCase();
+  if (v === "PENDING") return "未準備";
+  if (v === "PREPARED") return "準備中";
+  if (v === "SHIPPED") return "発送済み";
+  if (v === "IN_TRANSIT") return "配送中";
+  if (v === "DELIVERED") return "配達完了";
+  if (v === "CANCELLED") return "取消";
+  if (v === "CREATED") return "準備中";
   return v || "-";
 }
 
@@ -334,6 +348,43 @@ export default function TradeDetail() {
       {trade ? (
         <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, marginTop: 10 }}>
           <div>状態: {statusJa(status)}</div>
+          <div style={{ marginTop: 10, padding: 10, border: "1px solid #ddd", borderRadius: 10 }}>
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>配送状態（ヤマト）</div>
+            {Array.isArray(trade?.shipping_labels) && trade.shipping_labels.length > 0 ? (
+              <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 13 }}>
+                <thead>
+                  <tr>
+                    <th style={{ border: "1px solid #ddd", padding: 6 }}>direction</th>
+                    <th style={{ border: "1px solid #ddd", padding: 6 }}>label</th>
+                    <th style={{ border: "1px solid #ddd", padding: 6 }}>状態</th>
+                    <th style={{ border: "1px solid #ddd", padding: 6 }}>更新</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trade.shipping_labels.map((x, i) => (
+                    <tr key={i}>
+                      <td style={{ border: "1px solid #ddd", padding: 6 }}>{String(x.direction || "")}</td>
+                      <td style={{ border: "1px solid #ddd", padding: 6 }}>
+                        <a href={`${SHIPPING_URL}/labels/${String(x.label_code || "")}`} target="_blank" rel="noreferrer">
+                          {String(x.label_code || "")}
+                        </a>
+                      </td>
+                      <td style={{ border: "1px solid #ddd", padding: 6 }}>{yamatoStatusJa(x.status)}</td>
+                      <td style={{ border: "1px solid #ddd", padding: 6 }}>
+                        {x.updated_at ? new Date(x.updated_at).toLocaleString() : "-"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div style={{ fontSize: 13, opacity: 0.7 }}>ラベル未作成（取引が承諾されると作成されます）</div>
+            )}
+            <div style={{ marginTop: 8 }}>
+              <button onClick={reload}>配送状態を再読込</button>
+            </div>
+          </div>
+
 
           <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap" }}>
             <div style={{ padding: 10, border: "1px solid #ddd", borderRadius: 10 }}>

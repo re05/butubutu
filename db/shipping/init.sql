@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS shipping_labels (
   to_user_id   INTEGER NOT NULL,
   item_summary TEXT NOT NULL DEFAULT '',
   carrier TEXT NOT NULL DEFAULT 'yamato',
-  status  TEXT NOT NULL DEFAULT 'Created', -- Created / Shipped / Delivered / Cancelled
+  status  TEXT NOT NULL DEFAULT 'PENDING', -- PENDING / PREPARED / SHIPPED / IN_TRANSIT / DELIVERED / CANCELLED
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (trade_id, direction),

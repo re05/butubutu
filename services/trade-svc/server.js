@@ -78,6 +78,38 @@ function postJson(urlStr, headers, bodyObj) {
   });
 }
 
+function getJson(urlStr, headers) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const lib = u.protocol === 'https:' ? https : http;
+
+    const req = lib.request(
+      {
+        hostname: u.hostname,
+        port: u.port ? Number(u.port) : (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + (u.search || ''),
+        method: 'GET',
+        headers: {
+          ...(headers || {}),
+          'Accept': 'application/json'
+        }
+      },
+      (res) => {
+        let buf = '';
+        res.on('data', (d) => (buf += d));
+        res.on('end', () => {
+          let json = null;
+          try { json = buf ? JSON.parse(buf) : null; } catch { json = null; }
+          resolve({ status: res.statusCode || 0, json, raw: buf });
+        });
+      }
+    );
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 async function decreaseStockViaListingSvc(items) {
   const base = process.env.LISTING_SVC_URL || 'http://listing-svc:4010';
   const token = process.env.INTERNAL_TOKEN || '';
@@ -464,7 +496,22 @@ app.get('/trades/:id', authRequired, async (req,res)=>{
       [id]
     );
 
-    return res.json({ ...trade, items: items.rows });
+    let shipping_labels = [];
+    try {
+      const base = process.env.SHIPPING_SVC_URL || 'http://shipping-svc:4040';
+      const token = process.env.INTERNAL_TOKEN || '';
+      if (token) {
+        const resp = await getJson(`${base}/internal/trades/${id}/labels`, { 'X-Internal-Token': token });
+        if (resp.status >= 200 && resp.status < 300) {
+          shipping_labels = Array.isArray(resp.json?.labels) ? resp.json.labels : [];
+        }
+      }
+    } catch (e) {
+      // shipping-svc 取得失敗でも取引本体は返す（デモでは許容）
+      shipping_labels = [];
+    }
+
+    return res.json({ ...trade, items: items.rows, shipping_labels });
   }catch(e){
     console.error(e);
     return res.status(500).json({error:'server_error'});

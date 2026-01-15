@@ -160,6 +160,7 @@ services:
       VITE_LISTING_URL: "http://localhost:4110"
       VITE_TRADE_URL: "http://localhost:4120"
       VITE_FX_URL: "http://localhost:4130"
+      VITE_SHIPPING_URL: "http://localhost:4140"
     depends_on:
       auth-svc:
         condition: service_started

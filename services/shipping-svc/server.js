@@ -238,66 +238,138 @@ app.get('/labels/:code', async (req, res) => {
 /** ヤマト側（管理画面の想定）：ラベル一覧 */
 app.get('/yamato/orders', async (req, res) => {
   try {
-    const r = await pool.query(
-      `SELECT id, trade_id, direction, label_code, status, item_summary, created_at, updated_at
+    const q = await pool.query(
+      `SELECT id, trade_id, direction, label_code, from_user_id, to_user_id, item_summary, status, created_at, updated_at
          FROM shipping_labels
         ORDER BY id DESC
         LIMIT 200`
     );
 
-    const rows = r.rows.map((x) => {
-      const id = Number(x.id);
-      return `<tr>
-        <td>${id}</td>
-        <td>${esc(x.trade_id)}</td>
-        <td>${esc(x.direction)}</td>
-        <td><a href="/labels/${esc(x.label_code)}" target="_blank">${esc(x.label_code)}</a></td>
-        <td>${esc(x.status)}</td>
-        <td class="muted">${esc((x.item_summary || '').slice(0, 80))}</td>
-        <td class="muted">${esc(x.created_at)}</td>
-        <td>
-          <form method="post" action="/yamato/orders/${id}/status">
-            <select name="status">
-              <option value="Created">Created</option>
-              <option value="Shipped">Shipped</option>
-              <option value="Delivered">Delivered</option>
-              <option value="Cancelled">Cancelled</option>
-            </select>
-            <button type="submit">更新</button>
-          </form>
-        </td>
-      </tr>`;
-    }).join('\n');
+    // 住所は auth-svc から取得（宛先だけ表示）
+    // 200件すべて毎回問い合わせると遅いので、簡易キャッシュする
+    const cache = new Map();
+
+    async function getAddrCached(uid) {
+      if (!uid) return null;
+      if (cache.has(uid)) return cache.get(uid);
+      const a = await fetchAddress(uid);
+      cache.set(uid, a);
+      return a;
+    }
+
+    function normalizeStatus(s) {
+      const v = String(s || '').toUpperCase();
+      if (v === 'CREATED') return 'PREPARED';
+      if (v === 'DELIVERED') return 'DELIVERED';
+      if (v === 'SHIPPED') return 'SHIPPED';
+      if (v === 'CANCELLED') return 'CANCELLED';
+      if (v === 'PENDING') return 'PENDING';
+      if (v === 'PREPARED') return 'PREPARED';
+      if (v === 'IN_TRANSIT') return 'IN_TRANSIT';
+      return v || 'PENDING';
+    }
+
+    const rows = [];
+    for (const r of q.rows) {
+      const toAddr = await getAddrCached(Number(r.to_user_id));
+      const addrText = toAddr
+        ? `${esc(toAddr.postal_code || '')} ${esc(toAddr.address1 || '')} ${esc(toAddr.address2 || '')}`
+        : `user_id:${esc(r.to_user_id)}`;
+      const phoneText = toAddr ? esc(toAddr.phone || '') : '-';
+
+      const st = normalizeStatus(r.status);
+
+      rows.push(`
+        <tr>
+          <td>${esc(r.trade_id)}</td>
+          <td>${esc(r.direction)}</td>
+          <td><a href="/labels/${esc(r.label_code)}" target="_blank" rel="noreferrer">${esc(r.label_code)}</a></td>
+          <td>${esc(r.item_summary || '')}</td>
+          <td>${addrText}</td>
+          <td>${phoneText}</td>
+          <td><span class="badge">${esc(st)}</span></td>
+          <td class="actions">
+            <form method="POST" action="/yamato/orders/${Number(r.id)}/status">
+              <input type="hidden" name="yamato_status" value="PREPARED" />
+              <button type="submit">準備中</button>
+            </form>
+            <form method="POST" action="/yamato/orders/${Number(r.id)}/status">
+              <input type="hidden" name="yamato_status" value="SHIPPED" />
+              <button type="submit">発送済み</button>
+            </form>
+            <form method="POST" action="/yamato/orders/${Number(r.id)}/status">
+              <input type="hidden" name="yamato_status" value="IN_TRANSIT" />
+              <button type="submit">配送中</button>
+            </form>
+            <form method="POST" action="/yamato/orders/${Number(r.id)}/status">
+              <input type="hidden" name="yamato_status" value="DELIVERED" />
+              <button type="submit">配達完了</button>
+            </form>
+            <form method="POST" action="/yamato/orders/${Number(r.id)}/status">
+              <input type="hidden" name="yamato_status" value="CANCELLED" />
+              <button type="submit">取消</button>
+            </form>
+          </td>
+        </tr>
+      `);
+    }
 
     const html = `<!doctype html>
-<html><head><meta charset="utf-8"/><title>Yamato</title>
-<style>
-body{font-family:sans-serif;margin:24px;}
-table{border-collapse:collapse;width:100%;}
-th,td{border:1px solid #ccc;padding:8px;font-size:14px;vertical-align:top;}
-th{background:#f5f5f5;}
-.muted{color:#555;font-size:12px;}
-</style></head>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ヤマト管理</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:24px;}
+    table{border-collapse:collapse; width:100%;}
+    th,td{border:1px solid #ddd; padding:8px; font-size:13px; vertical-align:top;}
+    th{background:#fafafa;}
+    .badge{display:inline-block; padding:2px 6px; border-radius:10px; background:#eee;}
+    .actions form{display:inline-block; margin:0 4px 4px 0;}
+    button{padding:6px 10px; cursor:pointer;}
+  </style>
+</head>
 <body>
-<h1>ヤマト管理（shipping-svc）</h1>
-<table>
-<thead><tr><th>id</th><th>trade_id</th><th>direction</th><th>label</th><th>status</th><th>内容</th><th>created</th><th>更新</th></tr></thead>
-<tbody>${rows || ''}</tbody>
-</table>
-</body></html>`;
+  <h2>ヤマト状態 管理（簡易）</h2>
+  <p>この画面はデモ用です。shipping-svc の shipping-db に対して状態を更新します。</p>
+  <table>
+    <thead>
+      <tr>
+        <th>trade_id</th>
+        <th>direction</th>
+        <th>label</th>
+        <th>内容</th>
+        <th>住所（宛先）</th>
+        <th>電話</th>
+        <th>状態</th>
+        <th>更新</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.join('\n')}
+    </tbody>
+  </table>
+</body>
+</html>`;
+
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.send(html);
+    return res.status(200).send(html);
   } catch (e) {
     console.error(e);
     return res.status(500).send('server error');
   }
 });
 
+
 app.post('/yamato/orders/:id/status', async (req, res) => {
   const id = Number(req.params.id);
-  const status = (req.body?.status || '').toString().trim();
+  const yamato_status = (req.body?.yamato_status || '').toString().trim().toUpperCase();
   if (!Number.isInteger(id) || id <= 0) return res.status(400).send('bad id');
-  if (!status) return res.status(400).send('bad status');
+  if (!yamato_status) return res.status(400).send('bad status');
+
+  // 受け取った値はこの範囲だけ許可
+  const allow = new Set(['PENDING','PREPARED','SHIPPED','IN_TRANSIT','DELIVERED','CANCELLED']);
+  const next = allow.has(yamato_status) ? yamato_status : 'PENDING';
 
   const client = await pool.connect();
   try {
@@ -308,17 +380,13 @@ app.post('/yamato/orders/:id/status', async (req, res) => {
           SET status=$1, updated_at=now()
         WHERE id=$2
       RETURNING id`,
-      [status, id]
+      [next, id]
     );
+
     if (u.rowCount === 0) {
       await client.query('ROLLBACK');
       return res.status(404).send('not found');
     }
-
-    await client.query(
-      `INSERT INTO shipping_events(label_id, event) VALUES ($1,$2)`,
-      [id, `Status:${status}`]
-    );
 
     await client.query('COMMIT');
     return res.redirect('/yamato/orders');
@@ -330,6 +398,7 @@ app.post('/yamato/orders/:id/status', async (req, res) => {
     client.release();
   }
 });
+
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4040;
 app.listen(PORT, () => console.log(`shipping-svc listening on ${PORT}`));
